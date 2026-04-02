@@ -1,0 +1,72 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+MANIFEST
+
+# ── Virtual Environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env.local
+.env.*.local
+
+# ── Secrets & Credentials ─────────────────────────────────────────────────────
+.env
+*.key
+*.pem
+*.p12
+secrets.json
+credentials.json
+
+# ── Pipeline Outputs ─────────────────────────────────────────────────────────
+GraphRCA_output/
+logs/
+*.log
+*.jsonl
+
+# ── Trace Data ───────────────────────────────────────────────────────────────
+trace_output/
+traces/
+*.csv
+
+# ── Test Cache ────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Type Checking ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+.pyright/
+
+# ── Neo4j ─────────────────────────────────────────────────────────────────────
+neo4j_data/
+neo4j_logs/
+
+# ── Temp files ────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+tmp/
+temp/
