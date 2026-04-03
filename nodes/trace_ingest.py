@@ -10,7 +10,7 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
+from GraphRCA_agent.state import PipelineState
 
 # Reuse existing Stratus ingest tools
 from stratus.pipeline.tools.ingest_tools import (

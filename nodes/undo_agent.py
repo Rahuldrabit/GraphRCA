@@ -13,8 +13,8 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
-from GraphRCA.tools.safety_tools import (
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.tools.safety_tools import (
     compute_health_score,
     health_regressed,
     UndoStack,

@@ -8,7 +8,7 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
+from GraphRCA_agent.state import PipelineState
 
 from stratus.pipeline.tools.detection_tools import (
     compute_ewma_baseline,
@@ -66,7 +66,7 @@ def detection_node(state: PipelineState) -> Dict[str, Any]:
                 primary_error_service = "unknown"
 
         # 4. Compute pre-mitigation health score μ(s)
-        from GraphRCA.tools.safety_tools import compute_health_score
+        from GraphRCA_agent.tools.safety_tools import compute_health_score
         sla_violations = state.get("sla_violations", [])
         unhealthy_nodes = state.get("unhealthy_nodes", [])
         health_before = compute_health_score(alerts, sla_violations, unhealthy_nodes)

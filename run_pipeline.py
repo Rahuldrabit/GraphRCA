@@ -140,7 +140,7 @@ def run_pipeline(
     log_file = setup_logging(output_dir, verbose)
 
     # Configure LLM justification logging
-    from GraphRCA.llm import set_llm_log_dir
+    from GraphRCA_agent.llm import set_llm_log_dir
     set_llm_log_dir(output_dir)
 
     logger = logging.getLogger("graphrca.runner")
@@ -189,7 +189,7 @@ def run_pipeline(
     }
 
     # Run the LangGraph
-    from GraphRCA.graph import get_graph
+    from GraphRCA_agent.graph import get_graph
     app = get_graph()
 
     logger.info("\n🚀 Launching LangGraph pipeline...\n")
@@ -299,7 +299,7 @@ def run_pipeline(
 # ── AIOpsLab Integration (Pillar 4) ──────────────────────────────────────────
 
 
-def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False) -> dict:
+def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool = False) -> dict:
     """Run GraphRCA against an AIOpsLab benchmark problem.
 
     Mirrors the pattern from stratus/src/stratus/main.py exactly:
@@ -311,13 +311,20 @@ def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False)
     All LLM outputs are logged to llm_justification.jsonl for audit.
 
     Args:
-        problem_id: AIOpsLab problem ID (e.g., "misconfig_app_hotel_res-detection-1")
-        output_dir: Output directory for reports
+        problem_id: AIOpsLab problem ID (e.g., "misconfig_app_hotel_res-detection-1").
+                    Falls back to TASK_NAME env var.
+        output_dir: Output directory for reports.
+                    Falls back to OUTPUT_DIRECTORY env var.
         verbose: Debug logging
 
     Returns:
         Benchmark result dict with TTM and success flag
     """
+    # Support env-var fallbacks (for test_graphrca.sh integration)
+    if problem_id is None:
+        problem_id = os.environ.get("TASK_NAME", "misconfig_app_hotel_res-detection-1")
+    if output_dir is None:
+        output_dir = os.environ.get("OUTPUT_DIRECTORY")
     if output_dir is None:
         ts = datetime.now().strftime("%m-%d_%H-%M-%S")
         output_dir = os.path.join("GraphRCA_output", f"aiopslab-{problem_id[:30]}-{ts}")
@@ -325,7 +332,7 @@ def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False)
     log_file = setup_logging(output_dir, verbose)
 
     # Configure LLM justification logging
-    from GraphRCA.llm import set_llm_log_dir
+    from GraphRCA_agent.llm import set_llm_log_dir
     set_llm_log_dir(output_dir)
 
     logger = logging.getLogger("graphrca.aiopslab")
@@ -361,7 +368,7 @@ def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False)
     logger.info(f"[AIOpsLab] Instructions:\n{str(instructions)[:300]}")
 
     # Create threaded agent (mirrors StratusAgent_AIOpsLab)
-    from GraphRCA.agent_aiopslab import GraphRCAAgent
+    from GraphRCA_agent.agent_aiopslab import GraphRCAAgent
     use_neo4j = os.getenv("NEO4J_ENABLED", "False").lower() == "true"
 
     agent = GraphRCAAgent(
@@ -383,11 +390,31 @@ def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False)
 
     agent.finalize()
 
+    # ── Extract AIOpsLab evaluation results ──────────────────────────────
+    eval_results = {}
+    try:
+        session = orchestrator.session
+        if hasattr(session, "results") and session.results:
+            eval_results = dict(session.results)
+    except Exception as e:
+        logger.warning(f"[AIOpsLab] Could not extract eval results: {e}")
+
+    # Save eval_results.json
+    if eval_results:
+        eval_path = os.path.join(output_dir, "eval_results.json")
+        with open(eval_path, "w") as f:
+            json.dump(eval_results, f, indent=2, default=str)
+        logger.info(f"[AIOpsLab] Eval results saved: {eval_path}")
+
+    # ── Print Stratus-format evaluation output ───────────────────────────
+    _print_eval_banner(task_type, eval_results, output_dir, agent)
+
     # Build result
     result = agent.result or {}
     result["total_elapsed_seconds"] = total_elapsed
     result["problem_id"] = problem_id
     result["task_type"] = task_type
+    result["eval_results"] = eval_results
 
     # Save benchmark result
     bench_path = os.path.join(output_dir, "benchmark_result.json")
@@ -404,6 +431,58 @@ def run_aiopslab(problem_id: str, output_dir: str = None, verbose: bool = False)
     logger.info("=" * 70)
 
     return result
+
+
+def _print_eval_banner(task_type: str, eval_results: dict, output_dir: str, agent):
+    """Print evaluation results in the same format as Stratus run.log output."""
+    # Validation result line
+    validation_success = eval_results.get("success", True)
+    validation_issues = eval_results.get("issues", [])
+    print(f"\nValidation result: {{'success': {validation_success}, 'issues': {validation_issues}}}")
+    if validation_success:
+        print("######### VALIDATION SUCCESSFUL #########")
+    else:
+        print("######### VALIDATION FAILED #########")
+
+    # Output written line
+    last_output = os.path.join(output_dir, f"agent_output_{max(agent._run_count - 1, 0)}.json")
+    print(f"Output written to: {last_output}")
+
+    # Evaluation section
+    print("== Evaluation ==")
+
+    # Task-type-specific accuracy
+    metric_map = {
+        "detection": ("Detection Accuracy", "TTD"),
+        "localization": ("Localization Accuracy", "TTL"),
+        "analysis": ("system_level_correct", "TTA"),
+        "mitigation": ("Mitigation Success", "TTM"),
+    }
+    accuracy_key, time_key = metric_map.get(task_type, ("Accuracy", "Time"))
+
+    accuracy_val = eval_results.get(accuracy_key, eval_results.get("Detection Accuracy", "N/A"))
+    if task_type == "detection":
+        correct = "Yes" if accuracy_val == "Correct" else "No"
+        print(f"Correct detection: {correct}")
+
+    # Compact results dict (mirrors Stratus format)
+    results_summary = {
+        accuracy_key: accuracy_val,
+        time_key: eval_results.get(time_key, eval_results.get("TTD", 0)),
+        "steps": eval_results.get("steps", eval_results.get("num_steps_taken", 0)),
+        "in_tokens": eval_results.get("in_tokens", 0),
+        "out_tokens": eval_results.get("out_tokens", 0),
+    }
+    print(f"\033[35mResults:\n\033[0m{results_summary}")
+
+    # Fault recovery section
+    namespace = getattr(agent, "namespace", "unknown")
+    root_svc = "unknown"
+    if agent.result and isinstance(agent.result, dict):
+        root_svc = agent.result.get("summary", {}).get("root_cause_service", "unknown")
+    print(f"== Fault Recovery ==")
+    print(f"Recovering for service: {root_svc} | namespace: {namespace}")
+    print(f"Service: {root_svc} | Namespace: {namespace}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -453,11 +532,11 @@ Examples:
 
     if args.aiopslab:
         result = run_aiopslab(
-            problem_id=args.problem_id,
-            output_dir=args.output_dir,
+            problem_id=args.problem_id or os.environ.get("TASK_NAME"),
+            output_dir=args.output_dir or os.environ.get("OUTPUT_DIRECTORY"),
             verbose=args.verbose,
         )
-        print(json.dumps({"status": "done", "problem_id": args.problem_id,
+        print(json.dumps({"status": "done", "problem_id": result.get("problem_id", args.problem_id),
                           "ttm": result.get("ttm_seconds", 0)}, indent=2))
     else:
         result = run_pipeline(

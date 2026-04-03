@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
+from GraphRCA_agent.state import PipelineState
 
 from stratus.pipeline.tools.graph_tools import (
     build_dag,

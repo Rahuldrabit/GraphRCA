@@ -10,8 +10,8 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
-from GraphRCA.tools.causal_tools import (
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.tools.causal_tools import (
     temporal_order_analysis,
     compute_pairwise_causal_scores,
     rerank_with_causality,

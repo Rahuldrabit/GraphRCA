@@ -9,9 +9,9 @@ import logging
 import time
 from typing import Any, Dict, List
 
-from GraphRCA.state import PipelineState
-from GraphRCA.llm import llm_reason
-from GraphRCA.tools.ebpf_tools import get_ebpf_signals_for_suspects
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.llm import llm_reason
+from GraphRCA_agent.tools.ebpf_tools import get_ebpf_signals_for_suspects
 
 logger = logging.getLogger(__name__)
 

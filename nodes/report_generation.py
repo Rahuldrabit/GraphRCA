@@ -11,8 +11,8 @@ import os
 import re
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
-from GraphRCA.llm import llm_reason
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.llm import llm_reason
 
 logger = logging.getLogger(__name__)
 

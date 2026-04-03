@@ -50,6 +50,11 @@ class GraphRCAAgent:
         self.result = None
         self.namespace = self._extract_namespace(problem_desc)
 
+        # Run tracking
+        self._run_count = 0
+        self._start_time = time.time()
+        self._run_mode = "VALIDATION_RETRY" if task_type in ("mitigation", "detection") else "NAIVE"
+
         # Semaphore-based communication (same as Stratus)
         self.prompt_semaphore = threading.Semaphore(0)
         self.command_semaphore = threading.Semaphore(0)
@@ -58,7 +63,7 @@ class GraphRCAAgent:
         self.stop_event = threading.Event()
         self.generator = self._communicator()
 
-        logger.info(f"[GraphRCA Agent] task_type={task_type}, namespace={self.namespace}")
+        logger.info(f"[GraphRCA Agent] task_type={task_type}, namespace={self.namespace}, mode={self._run_mode}")
 
     def _extract_namespace(self, desc: str) -> str:
         """Extract Kubernetes namespace from problem description."""
@@ -115,11 +120,38 @@ class GraphRCAAgent:
         self.agent_thread.start()
 
     def finalize(self):
-        """Stop the agent and wait for thread to finish."""
+        """Stop the agent, write run stats, and wait for thread to finish."""
         self.stop_event.set()
         if hasattr(self, "agent_thread"):
             self.agent_thread.join(timeout=10)
+
+        # Write graphrca_run_stats.json
+        self._write_run_stats()
         logger.info("[GraphRCA Agent] Finalized")
+
+    def _write_run_stats(self):
+        """Write aggregated run statistics (mirrors Stratus stratus_run_stats.json)."""
+        from GraphRCA_agent.llm import get_token_totals
+        tokens = get_token_totals()
+        total_elapsed = round(time.time() - self._start_time, 2)
+
+        stats = {
+            "total_runs": self._run_count,
+            "mode": self._run_mode,
+            "final_run_time": datetime.now().isoformat(),
+            "total_tokens": tokens["total_tokens"],
+            "prompt_tokens": tokens["prompt_tokens"],
+            "completion_tokens": tokens["completion_tokens"],
+            "pipeline_elapsed_seconds": total_elapsed,
+        }
+
+        try:
+            path = os.path.join(self.output_dir, "graphrca_run_stats.json")
+            with open(path, "w") as f:
+                json.dump(stats, f, indent=2)
+            logger.info(f"[Agent] Run stats → {path}")
+        except Exception as e:
+            logger.warning(f"[Agent] Failed to write run stats: {e}")
 
     def _run(self):
         """Main agent logic — runs in daemon thread."""
@@ -146,12 +178,16 @@ class GraphRCAAgent:
                 self._submit_default()
                 return
 
-            # Step 3: Run pipeline — with VALIDATION_RETRY loop for mitigation tasks
+            # Step 3: Run pipeline — with VALIDATION_RETRY for mitigation and detection
             # (Mirrors Stratus base.py VALIDATION_RETRY pattern)
-            if self.task_type == "mitigation":
+            if self.task_type in ("mitigation", "detection"):
                 report = self._run_with_validation_retry(trace_dir)
             else:
+                # NAIVE mode for localization/analysis (single run)
                 report = self._run_pipeline(trace_dir)
+                self._run_count = 1
+                self._write_run_output(0, report)
+                self._append_run_log(0, report, {"success": True, "issues": []}, "N/A")
 
             # Step 4: Submit results based on task type
             self._submit_results(report)
@@ -161,14 +197,18 @@ class GraphRCAAgent:
             self._submit_default()
 
     def _run_with_validation_retry(self, trace_dir: str) -> dict:
-        """VALIDATION_RETRY loop for mitigation tasks — mirrors Stratus base.py run().
+        """VALIDATION_RETRY loop — mirrors Stratus base.py run().
+
+        Supports both mitigation and detection tasks:
+        - Mitigation: validates pod health after executing fixes
+        - Detection: cross-checks pipeline answer against cluster state
 
         Flow per attempt:
           1. Run LangGraph pipeline (with reflection from previous failed run)
           2. Write agent_output_N.json
           3. Wait VALIDATION_WAIT_SECONDS for cluster to stabilize
-          4. Validate cluster pod health
-          5. If healthy → done.  If not → collect reflection → retry.
+          4. Validate cluster state
+          5. If consistent → done.  If not → collect reflection → retry.
         """
         reflection = ""
         report = {}
@@ -181,16 +221,19 @@ class GraphRCAAgent:
             run_start = time.time()
             report = self._run_pipeline(trace_dir, reflection=reflection)
             self._write_run_output(run_count, report)
+            self._run_count = run_count + 1
 
             logger.info(f"[RetryLoop] Waiting {VALIDATION_WAIT_SECONDS}s for cluster to stabilize...")
             time.sleep(VALIDATION_WAIT_SECONDS)
 
-            validation = self._validate_mitigation()
+            validation = self._validate_cluster(report)
             elapsed = round(time.time() - run_start, 2)
             logger.info(f"[RetryLoop] Run {run_count}: validation={'PASS' if validation['success'] else 'FAIL'} in {elapsed}s")
 
+            self._append_run_log(run_count, report, validation, reflection)
+
             if validation["success"]:
-                logger.info("[RetryLoop] Validation passed — mitigation successful")
+                logger.info(f"[RetryLoop] Validation passed — {self.task_type} successful")
                 break
 
             if run_count < MAX_RETRY_ATTEMPTS - 1:
@@ -200,6 +243,51 @@ class GraphRCAAgent:
                 logger.warning(f"[RetryLoop] Max retries ({MAX_RETRY_ATTEMPTS}) reached — submitting best result")
 
         return report
+
+    def _validate_cluster(self, report: dict) -> dict:
+        """Validate cluster state — task-type aware.
+
+        For mitigation: check pod health (existing _validate_mitigation).
+        For detection: cross-check pipeline answer against cluster state.
+        """
+        pod_validation = self._validate_mitigation()
+
+        if self.task_type == "detection":
+            n_alerts = report.get("detection", {}).get("alert_count", 0)
+            agent_says_anomaly = n_alerts > 0
+            cluster_has_issues = not pod_validation["success"]
+
+            if agent_says_anomaly == cluster_has_issues:
+                return {"success": True, "issues": []}
+            elif agent_says_anomaly and not cluster_has_issues:
+                return {"success": False, "issues": ["Agent detected anomaly but cluster pods appear healthy. Consider re-evaluating."]}
+            else:
+                return {"success": False, "issues": pod_validation["issues"] + ["Agent said No anomaly but cluster has unhealthy pods."]}
+
+        # For mitigation, use pod health directly
+        return pod_validation
+
+    def _append_run_log(self, run_count: int, report: dict, validation: dict, reflection: str):
+        """Append per-attempt summary to run_logs.txt (mirrors Stratus run_logs.txt)."""
+        log_path = os.path.join(self.output_dir, "run_logs.txt")
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"--- RUN {run_count} ---\n")
+                f.write(f"Start time: {datetime.now().isoformat()}\n")
+                f.write(f"Task type: {self.task_type}\n")
+                f.write(f"Mode: {self._run_mode}\n")
+                root_cause = report.get("summary", {}).get("root_cause_service", "N/A")
+                alerts = report.get("detection", {}).get("alert_count", 0)
+                f.write(f"Root cause: {root_cause}\n")
+                f.write(f"Alerts detected: {alerts}\n")
+                f.write(f"Validation: {'PASS' if validation['success'] else 'FAIL'}\n")
+                if validation.get("issues"):
+                    for issue in validation["issues"]:
+                        f.write(f"  Issue: {issue}\n")
+                f.write(f"Reflection: {reflection if reflection else 'N/A'}\n")
+                f.write(f"End time: {datetime.now().isoformat()}\n\n")
+        except Exception as e:
+            logger.warning(f"[Agent] Failed to append run log: {e}")
 
     def _fetch_traces(self) -> str:
         """Fetch traces from AIOpsLab cluster via generator."""
@@ -280,7 +368,7 @@ class GraphRCAAgent:
         Uses kubectl to detect CrashLoopBackOff / Error / Pending pods.
         Returns {"success": bool, "issues": list[str]}.
         """
-        from GraphRCA.tools.kube_tools import exec_kubectl_command
+        from GraphRCA_agent.tools.kube_tools import exec_kubectl_command
         issues = []
         try:
             result = exec_kubectl_command(f"kubectl get pods -n {self.namespace} --no-headers")
@@ -328,10 +416,10 @@ class GraphRCAAgent:
 
     def _run_pipeline(self, trace_dir: str, reflection: str = "") -> dict:
         """Run the full GraphRCA LangGraph pipeline on the fetched traces."""
-        from GraphRCA.llm import set_llm_log_dir
+        from GraphRCA_agent.llm import set_llm_log_dir
         set_llm_log_dir(self.output_dir)
 
-        from GraphRCA.run_pipeline import run_pipeline
+        from GraphRCA_agent.run_pipeline import run_pipeline
         if reflection:
             logger.info(f"[Agent] Pipeline with reflection: {reflection[:120]}...")
         else:

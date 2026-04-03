@@ -18,17 +18,17 @@ from typing import Literal
 
 from langgraph.graph import StateGraph, END
 
-from GraphRCA.state import PipelineState
-from GraphRCA.nodes.trace_ingest import trace_ingest_node
-from GraphRCA.nodes.graph_builder import graph_builder_node
-from GraphRCA.nodes.detection import detection_node
-from GraphRCA.nodes.memory_rag import memory_search_node, memory_store_node
-from GraphRCA.nodes.rca import rca_node
-from GraphRCA.nodes.causal_ranker import causal_ranker_node
-from GraphRCA.nodes.log_pattern import log_pattern_node
-from GraphRCA.nodes.mitigation import mitigation_node
-from GraphRCA.nodes.undo_agent import undo_agent_node
-from GraphRCA.nodes.report_generation import report_generation_node
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.nodes.trace_ingest import trace_ingest_node
+from GraphRCA_agent.nodes.graph_builder import graph_builder_node
+from GraphRCA_agent.nodes.detection import detection_node
+from GraphRCA_agent.nodes.memory_rag import memory_search_node, memory_store_node
+from GraphRCA_agent.nodes.rca import rca_node
+from GraphRCA_agent.nodes.causal_ranker import causal_ranker_node
+from GraphRCA_agent.nodes.log_pattern import log_pattern_node
+from GraphRCA_agent.nodes.mitigation import mitigation_node
+from GraphRCA_agent.nodes.undo_agent import undo_agent_node
+from GraphRCA_agent.nodes.report_generation import report_generation_node
 
 logger = logging.getLogger(__name__)
 

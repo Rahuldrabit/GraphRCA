@@ -26,6 +26,8 @@ _openai_client: Optional[OpenAI] = None
 _chat_model = None
 _llm_log_path: Optional[str] = None
 _call_counter: int = 0
+_total_prompt_tokens: int = 0
+_total_completion_tokens: int = 0
 
 
 def set_llm_log_dir(output_dir: str):
@@ -36,11 +38,31 @@ def set_llm_log_dir(output_dir: str):
     logger.info(f"LLM justification log: {_llm_log_path}")
 
 
+def get_token_totals() -> dict:
+    """Return accumulated token usage across all LLM calls."""
+    return {
+        "prompt_tokens": _total_prompt_tokens,
+        "completion_tokens": _total_completion_tokens,
+        "total_tokens": _total_prompt_tokens + _total_completion_tokens,
+    }
+
+
+def reset_token_totals():
+    """Zero out token accumulators (e.g. between retry runs)."""
+    global _total_prompt_tokens, _total_completion_tokens
+    _total_prompt_tokens = 0
+    _total_completion_tokens = 0
+
+
 def _log_llm_call(caller: str, model: str, prompt: str, system_prompt: str,
                    response: str, tokens_used: dict, elapsed_s: float):
     """Append a structured JSON log entry for every LLM call."""
-    global _call_counter
+    global _call_counter, _total_prompt_tokens, _total_completion_tokens
     _call_counter += 1
+
+    # Accumulate token counts
+    _total_prompt_tokens += tokens_used.get("prompt", 0)
+    _total_completion_tokens += tokens_used.get("completion", 0)
 
     entry = {
         "call_id": _call_counter,

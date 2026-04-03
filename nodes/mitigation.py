@@ -8,8 +8,8 @@ import logging
 import time
 from typing import Any, Dict
 
-from GraphRCA.state import PipelineState
-from GraphRCA.tools.safety_tools import UndoStack, build_undo_entry
+from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.tools.safety_tools import UndoStack, build_undo_entry
 
 from stratus.pipeline.tools.mitigation_tools import (
     generate_mitigation_plan,

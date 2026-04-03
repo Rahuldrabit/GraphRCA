@@ -48,7 +48,12 @@ GraphRCA/
 │   ├── kube_tools.py     # Kubernetes action execution
 │   └── safety_tools.py   # Pillar 1: rollback & safety verification
 ├── .env                  # Secrets (API keys, Neo4j, benchmark config)
-└── quickrun.sh           # Quick-start script
+├── quickrun.sh           # Quick-start script
+├── test_graphrca.sh      # Per-task eval orchestrator (cluster setup + run + log)
+└── eval/
+    ├── eval_tasks.yaml   # Full AIOpsLab task list (detection/localization/analysis/mitigation)
+    ├── eval.py           # Batch eval runner — iterates all tasks from YAML
+    └── clean_ansi_from_log.py  # Strip ANSI escape codes from run.log
 ```
 
 ---
@@ -115,6 +120,87 @@ PYTHONPATH="AIOpsLab:stratus/src:$PWD" python -m GraphRCA.run_pipeline \
 
 Supported task types (auto-detected from problem ID): `detection`, `localization`, `analysis`, `mitigation`.
 
+---
+
+## Evaluation Workflow
+
+### Single-task eval (recommended)
+
+Run from the repo root (`GraphRCA/`):
+
+```bash
+# New kind cluster + run
+./GraphRCA_agent/test_graphrca.sh misconfig_app_hotel_res-detection-1
+
+# Reuse existing cluster (-p), explicit arch (-r)
+./GraphRCA_agent/test_graphrca.sh -p -r x86 misconfig_app_hotel_res-detection-1
+
+# Custom output directory
+./GraphRCA_agent/test_graphrca.sh -d my_output/run1 misconfig_app_hotel_res-detection-1
+
+# Only set up the kind cluster without running a task
+./GraphRCA_agent/test_graphrca.sh -s
+```
+
+Options:
+
+| Flag | Description |
+|------|-------------|
+| `-p` | Preserve existing cluster (skip delete/create) |
+| `-r x86\|arm` | Override architecture detection |
+| `-d <dir>` | Custom output directory (default: `eval/<MM-DD_HH-MM-SS>-<task>`) |
+| `-s` | Cluster setup only — skip running the task |
+| `-h` | Show help |
+
+Output lands in `eval/<MM-DD_HH-MM-SS>-<task_name>/`:
+
+```
+eval/04-03_14-30-00-misconfig_app_hotel_res-detection-1/
+├── run.log                        # Full stdout+stderr captured via tee
+└── graphrca_output/
+    ├── graphrca.log               # Python logging output
+    ├── incident_report.json       # Main analysis report
+    ├── llm_justification.jsonl    # All LLM calls (prompt, response, tokens)
+    ├── agent_output_0.json        # Per-attempt submit payload
+    ├── run_logs.txt               # Per-attempt summary (start/end time, validation)
+    ├── graphrca_run_stats.json    # Token usage + run count stats
+    ├── eval_results.json          # AIOpsLab evaluation metrics
+    └── reports/
+        ├── diagnosis_struct_out.json
+        └── remediation_struct_out.json
+```
+
+At the end of each run, the terminal prints a Stratus-format evaluation banner:
+
+```
+Validation result: {'success': True, 'issues': []}
+######### VALIDATION SUCCESSFUL #########
+Output written to: eval/.../graphrca_output/agent_output_0.json
+== Evaluation ==
+Correct detection: Yes
+Results:
+{'Detection Accuracy': 'Correct', 'TTD': 1205.67, 'steps': 30, 'in_tokens': 236415, 'out_tokens': 382}
+== Fault Recovery ==
+Recovering for service: frontend | namespace: hotel-reservation
+```
+
+### Batch eval (all tasks)
+
+```bash
+cd GraphRCA/GraphRCA_agent
+python eval/eval.py
+```
+
+This reads `eval/eval_tasks.yaml` and calls `test_graphrca.sh` sequentially for each task across all four task types. Each task spins up a fresh kind cluster unless you edit `eval.py` to pass `-p`.
+
+### ANSI log cleaning
+
+`test_graphrca.sh` automatically strips ANSI escape codes from `run.log` after each run. To clean a log manually:
+
+```bash
+python eval/clean_ansi_from_log.py path/to/run.log
+```
+
 ### Quick Run
 
 ```bash
@@ -125,13 +211,18 @@ bash GraphRCA/quickrun.sh
 
 ## Output
 
-Each run produces a timestamped directory under `GraphRCA_output/<timestamp>/`:
+**Standalone runs** produce a timestamped directory under `GraphRCA_output/<timestamp>/`.
+**Eval runs** (via `test_graphrca.sh`) produce `eval/<MM-DD_HH-MM-SS>-<task>/graphrca_output/`.
 
 | File | Description |
 |------|-------------|
 | `graphrca.log` | Full pipeline log (all nodes, timings, debug) |
 | `incident_report.json` | Main report (root cause, alerts, actions, health scores) |
 | `llm_justification.jsonl` | Every LLM call logged (prompt, response, tokens, timing) |
+| `agent_output_N.json` | Submit payload for each attempt (N=0,1,2…) |
+| `run_logs.txt` | Per-attempt summary (start/end time, task type, validation, reflection) |
+| `graphrca_run_stats.json` | Token totals (prompt/completion/total), run count, elapsed seconds |
+| `eval_results.json` | Raw AIOpsLab evaluation metrics (Detection Accuracy, TTD, steps, tokens) |
 | `reports/diagnosis_struct_out.json` | ITBench-compatible diagnosis output |
 | `reports/remediation_struct_out.json` | ITBench-compatible remediation output |
 
