@@ -21,6 +21,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+_TRUTHY = {"1", "true", "yes", "y", "on"}
+
 # ── Singletons ─────────────────────────────────────────────────────────
 _openai_client: Optional[OpenAI] = None
 _chat_model = None
@@ -64,17 +66,55 @@ def _log_llm_call(caller: str, model: str, prompt: str, system_prompt: str,
     _total_prompt_tokens += tokens_used.get("prompt", 0)
     _total_completion_tokens += tokens_used.get("completion", 0)
 
+    def _full_enabled() -> bool:
+        return os.getenv("GRAPHRCA_LLM_LOG_FULL", "").strip().lower() in _TRUTHY
+
+    def _max_chars(env_name: str, default: int) -> int:
+        try:
+            return int(os.getenv(env_name, str(default)))
+        except Exception:
+            return default
+
+    def _clip(text: str, env_name: str, default: int) -> str:
+        if not text:
+            return ""
+        if _full_enabled():
+            return text
+        limit = max(200, _max_chars(env_name, default))
+        if len(text) <= limit:
+            return text
+        head = text[: limit // 2]
+        tail = text[-(limit // 2) :]
+        return head + f"\n...[TRUNCATED {len(text) - limit} chars]...\n" + tail
+
     entry = {
         "call_id": _call_counter,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "caller": caller,
         "model": model,
-        "system_prompt": system_prompt[:500] if system_prompt else "",
-        "user_prompt": prompt[:2000],
-        "response": response[:3000],
+        "system_prompt": _clip(system_prompt, "GRAPHRCA_LLM_LOG_MAX_SYSTEM_CHARS", 500),
+        "user_prompt": _clip(prompt, "GRAPHRCA_LLM_LOG_MAX_USER_CHARS", 2000),
+        "response": _clip(response, "GRAPHRCA_LLM_LOG_MAX_RESPONSE_CHARS", 3000),
         "tokens": tokens_used,
         "elapsed_seconds": round(elapsed_s, 3),
     }
+
+    # Also emit to the structured tracer (if enabled)
+    try:
+        from GraphRCA_agent.trace_logger import trace_event
+
+        trace_event(
+            "llm.call",
+            caller=caller,
+            model=model,
+            system_prompt=system_prompt or "",
+            user_prompt=prompt or "",
+            response=response or "",
+            tokens=tokens_used,
+            elapsed_seconds=round(elapsed_s, 3),
+        )
+    except Exception:
+        pass
 
     # Write to pipeline output dir if configured
     log_path = _llm_log_path

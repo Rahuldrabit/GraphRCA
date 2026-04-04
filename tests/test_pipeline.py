@@ -43,14 +43,14 @@ def create_trace_dir():
 
 def test_graph_compiles():
     """GraphRCA StateGraph compiles without error."""
-    from GraphRCA.graph import build_graph
+    from GraphRCA_agent.graph import build_graph
     workflow = build_graph()
     app = workflow.compile()
     assert app is not None
 
 
 def test_state_schema_importable():
-    from GraphRCA.state import PipelineState
+    from GraphRCA_agent.state import PipelineState
     state: PipelineState = {
         "trace_dir": "./traces",
         "use_neo4j": False,
@@ -72,8 +72,8 @@ def test_pipeline_end_to_end_no_llm():
         "SERVICES: postgres, user-service\nSUMMARY: Postgres returning 500 errors\n---"
     )
 
-    with patch("GraphRCA.llm.llm_reason", return_value=mock_llm_response):
-        from GraphRCA.run_pipeline import run_pipeline
+    with patch("GraphRCA_agent.llm.llm_reason", return_value=mock_llm_response):
+        from GraphRCA_agent.run_pipeline import run_pipeline
         report = run_pipeline(
             trace_dir=trace_dir,
             output_dir=output_dir,
@@ -102,8 +102,8 @@ def test_health_score_computed():
     trace_dir = create_trace_dir()
     output_dir = tempfile.mkdtemp()
 
-    with patch("GraphRCA.llm.llm_reason", return_value="CLUSTER: test\nCOUNT: 1\nSEVERITY: LOW\nSERVICES: svc\nSUMMARY: test\n---"):
-        from GraphRCA.run_pipeline import run_pipeline
+    with patch("GraphRCA_agent.llm.llm_reason", return_value="CLUSTER: test\nCOUNT: 1\nSEVERITY: LOW\nSERVICES: svc\nSUMMARY: test\n---"):
+        from GraphRCA_agent.run_pipeline import run_pipeline
         report = run_pipeline(
             trace_dir=trace_dir,
             output_dir=output_dir,

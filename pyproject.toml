@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-graphrca = "GraphRCA.run_pipeline:main"
+graphrca = "GraphRCA_agent.run_pipeline:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -27,3 +27,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["AIOpsLab", ".venv", "venv", "GraphRCA_output", "eval", "__pycache__"]

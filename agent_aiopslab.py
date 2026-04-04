@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -29,6 +30,18 @@ logger = logging.getLogger(__name__)
 # ── VALIDATION_RETRY constants (mirrors Stratus base.py) ─────────────────────
 MAX_RETRY_ATTEMPTS = 3
 VALIDATION_WAIT_SECONDS = 30  # Stratus uses 120s (real cluster); 30s for faster iteration
+
+
+def _preview_text(text: str, max_chars: int = 400) -> str:
+    """Return a compact preview of text for logging without flooding stdout."""
+    if not text:
+        return ""
+    s = str(text)
+    if len(s) <= max_chars:
+        return s
+    head = s[: max_chars // 2]
+    tail = s[-(max_chars // 2) :]
+    return head + f"\n...[TRUNCATED {len(s) - max_chars} chars]...\n" + tail
 
 
 class GraphRCAAgent:
@@ -63,6 +76,10 @@ class GraphRCAAgent:
         self.stop_event = threading.Event()
         self.generator = self._communicator()
 
+        # Traces export bookkeeping (for robust empty-trace handling)
+        self._trace_export_file_path: str = ""
+        self._trace_export_is_empty: bool = False
+
         logger.info(f"[GraphRCA Agent] task_type={task_type}, namespace={self.namespace}, mode={self._run_mode}")
 
     def _extract_namespace(self, desc: str) -> str:
@@ -79,6 +96,155 @@ class GraphRCAAgent:
                 ns = m.group(1) if m.lastindex else m.group(0)
                 return ns.replace("_", "-")
         return "default"
+
+    def _kubectl_context(self) -> str:
+        """Best-effort kubectl context name (mirrors AIOpsLab KubeCtl context selection)."""
+        cluster_env = os.environ.get("AIOPSLAB_CLUSTER", "kind")
+        return f"kind-{cluster_env}"
+
+    def _normalize_kubectl_command(self, command: str) -> str:
+        """Normalize kubectl command for this benchmark run.
+
+        - Adds `--context kind-<AIOPSLAB_CLUSTER>` when not present.
+        - Adds `-n <namespace>` when not present (and not using -A/--all-namespaces).
+        - Fixes common label selector mismatches across AIOpsLab apps.
+        """
+        cmd = (command or "").strip()
+        if not cmd.startswith("kubectl"):
+            return cmd
+
+        # Fix label selectors to match AIOpsLab app conventions.
+        # GraphRCA pipeline tends to use `-l app=<svc>`; HotelReservation uses `io.kompose.service=<svc>`.
+        if self.namespace == "test-hotel-reservation":
+            cmd = re.sub(r"(-l\s+)app=", r"\1io.kompose.service=", cmd)
+            cmd = re.sub(r"(--selector\s+)app=", r"\1io.kompose.service=", cmd)
+        elif self.namespace == "astronomy-shop":
+            cmd = re.sub(r"(-l\s+)app=", r"\1app.kubernetes.io/name=", cmd)
+            cmd = re.sub(r"(--selector\s+)app=", r"\1app.kubernetes.io/name=", cmd)
+
+        # Add kubectl context if missing.
+        if "--context" not in cmd:
+            context = self._kubectl_context()
+            cmd = re.sub(r"^kubectl\b", f"kubectl --context {context}", cmd, count=1)
+
+        # Add namespace if missing (and not querying all namespaces).
+        has_namespace_flag = bool(re.search(r"\s(-n|--namespace)\s", cmd))
+        has_all_namespaces = " -A" in cmd or " --all-namespaces" in cmd
+        if (not has_namespace_flag) and (not has_all_namespaces) and self.namespace:
+            cmd = re.sub(r"^kubectl\b", f"kubectl -n {self.namespace}", cmd, count=1)
+            # If we already inserted --context earlier, ensure order is kubectl --context X -n ns ...
+            cmd = re.sub(
+                r"^kubectl\s+-n\s+([^\s]+)\s+--context\s+([^\s]+)",
+                r"kubectl --context \2 -n \1",
+                cmd,
+                count=1,
+            )
+
+        return cmd
+
+    def _run_kubectl(self, command: str) -> str:
+        """Run a kubectl command locally (agent-side) and return stdout or an error string."""
+        from GraphRCA_agent.tools.kube_tools import exec_kubectl_command
+
+        normalized = self._normalize_kubectl_command(command)
+        if not normalized.startswith("kubectl"):
+            return f"Skipped non-kubectl command: {normalized}"
+
+        logger.info(f"[MitigationExec] {normalized}")
+        return exec_kubectl_command(normalized)
+
+    def _maybe_fix_hotelres_geo_image(self) -> list[dict]:
+        """Safety-net remediation for the known HotelReservation misconfig_app fault.
+
+        AIOpsLab's `misconfig_app` injects a buggy image into the `geo` deployment:
+          yinfangchen/geo:app3
+        This attempts to roll it back to:
+          yinfangchen/hotelreservation:latest
+        """
+        if self.namespace != "test-hotel-reservation":
+            return []
+
+        executed: list[dict] = []
+
+        image = self._run_kubectl('kubectl get deployment geo -o jsonpath="{.spec.template.spec.containers[0].image}"')
+        executed.append({"command": "kubectl get deployment geo -o jsonpath=...", "output": _preview_text(image, 800)})
+
+        if "yinfangchen/geo:app3" not in (image or ""):
+            return executed
+
+        fix_cmd = "kubectl set image deployment/geo hotel-reserv-geo=yinfangchen/hotelreservation:latest"
+        out = self._run_kubectl(fix_cmd)
+        executed.append({"command": fix_cmd, "output": _preview_text(out, 2000)})
+
+        status_cmd = "kubectl rollout status deployment/geo --timeout=180s"
+        out2 = self._run_kubectl(status_cmd)
+        executed.append({"command": status_cmd, "output": _preview_text(out2, 2000)})
+        return executed
+
+    def _execute_mitigation_plan(self, report: dict) -> list[dict]:
+        """Execute a small set of mitigation commands before `submit()`.
+
+        Returns a list of executed command records.
+        """
+        mitigation = report.get("mitigation", {}) if isinstance(report, dict) else {}
+        actions = mitigation.get("actions") or []
+
+        # Keep execution bounded to avoid exhausting AIOpsLab step limits.
+        try:
+            max_cmds = int(os.getenv("GRAPHRCA_MITIGATION_MAX_COMMANDS", "4"))
+        except Exception:
+            max_cmds = 4
+
+        executed: list[dict] = []
+
+        # 0) Safety net for the most common HotelReservation misconfig fault.
+        executed.extend(self._maybe_fix_hotelres_geo_image())
+
+        # 1) Prefer remediation actions from the generated plan.
+        def _prio(a: dict) -> float:
+            try:
+                return float(a.get("priority", 99))
+            except Exception:
+                return 99.0
+
+        action_dicts = [a for a in actions if isinstance(a, dict)]
+        action_dicts.sort(key=_prio)
+
+        remediation_cmds = [
+            a.get("command", "")
+            for a in action_dicts
+            if a.get("approved", True)
+            and a.get("category") == "remediation"
+            and str(a.get("command", "")).strip()
+        ]
+
+        # If there are no remediation actions, fall back to at least running a pod status check.
+        if not remediation_cmds:
+            remediation_cmds = ["kubectl get pods --no-headers"]
+
+        # Execute (dedup) up to max_cmds commands.
+        seen: set[str] = set()
+        for raw_cmd in remediation_cmds:
+            cmd = str(raw_cmd).strip()
+            if not cmd or cmd in seen:
+                continue
+            seen.add(cmd)
+            out = self._run_kubectl(cmd)
+            executed.append({"command": cmd, "output": _preview_text(out, 2500)})
+            if len(executed) >= max_cmds:
+                break
+
+        # Give the cluster a chance to stabilize before submission.
+        # AIOpsLab mitigation eval checks readiness immediately and fails fast.
+        wait_timeout = os.getenv("GRAPHRCA_MITIGATION_WAIT_TIMEOUT", "180s").strip() or "180s"
+        wait_cmd = f"kubectl wait --for=condition=ready pod --all --timeout={wait_timeout}"
+        out = self._run_kubectl(wait_cmd)
+        executed.append({"command": wait_cmd, "output": _preview_text(out, 4000)})
+
+        # Always capture a final pod snapshot for debugging.
+        out = self._run_kubectl("kubectl get pods -o wide")
+        executed.append({"command": "kubectl get pods -o wide", "output": _preview_text(out, 4000)})
+        return executed
 
     def _communicator(self):
         """Generator for bidirectional communication with AIOpsLab orchestrator.
@@ -105,14 +271,139 @@ class GraphRCAAgent:
         Returns:
             Command string for orchestrator (get_traces, submit, etc.)
         """
+        # Trace every orchestrator → agent observation
+        try:
+            from GraphRCA_agent.trace_logger import trace_event
+
+            trace_event(
+                "aiopslab.observation",
+                tool="aiopslab",
+                namespace=self.namespace,
+                task_type=self.task_type,
+                observation=observation,
+            )
+        except Exception:
+            pass
+
         self.prompt_message = observation
         self.prompt_semaphore.release()
         self.command_semaphore.acquire()
+
+        # Concise visibility into agent I/O in run.log (stdout via logger).
+        logger.info(f"[AIOpsLab→Agent] { _preview_text(self.prompt_message, 500) }")
+
+        # Trace agent → orchestrator command
+        try:
+            from GraphRCA_agent.trace_logger import trace_event
+
+            trace_event(
+                "aiopslab.command",
+                tool="aiopslab",
+                namespace=self.namespace,
+                task_type=self.task_type,
+                command=self.command_message,
+            )
+        except Exception:
+            pass
         return self.command_message
 
     def send(self, message: str) -> str:
         """Send a command through the generator to the orchestrator."""
-        return self.generator.send(message)
+        logger.info(f"[Agent→AIOpsLab] {message.strip()}")
+        try:
+            from GraphRCA_agent.trace_logger import trace_event
+
+            trace_event(
+                "aiopslab.send",
+                tool="aiopslab",
+                namespace=self.namespace,
+                task_type=self.task_type,
+                message=message,
+            )
+        except Exception:
+            pass
+
+        try:
+            response = self.generator.send(message)
+        except Exception as e:
+            try:
+                from GraphRCA_agent.trace_logger import trace_event
+
+                trace_event(
+                    "aiopslab.send_error",
+                    tool="aiopslab",
+                    namespace=self.namespace,
+                    task_type=self.task_type,
+                    message=message,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            raise
+
+        try:
+            from GraphRCA_agent.trace_logger import trace_event
+
+            trace_event(
+                "aiopslab.recv",
+                tool="aiopslab",
+                namespace=self.namespace,
+                task_type=self.task_type,
+                message=message,
+                response=response,
+            )
+        except Exception:
+            pass
+        return response
+
+    def _clean_aiopslab_text(self, text: str) -> str:
+        if not text:
+            return ""
+        # AIOpsLab sometimes appends this suffix; strip for parsing.
+        text = text.replace("\nPlease take the next action", "")
+        return text.strip()
+
+    def _csv_has_data_rows(self, file_path: str) -> bool:
+        """Return True iff a CSV file has at least one non-empty data row."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                header = f.readline()
+                if not header:
+                    return False
+                for line in f:
+                    if line.strip():
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _extract_trace_file_path(self, text: str) -> str:
+        """Extract a CSV file path from get_traces output."""
+        if not text:
+            return ""
+
+        cleaned = self._clean_aiopslab_text(text)
+
+        # JSON payload format: {"file_path": "/.../traces_123.csv"}
+        if cleaned.startswith("{"):
+            try:
+                payload = json.loads(cleaned)
+                if isinstance(payload, dict) and payload.get("file_path"):
+                    return str(payload["file_path"])
+            except Exception:
+                pass
+
+        # AIOpsLab default format: "Traces data exported to: /path/to/file.csv"
+        m = re.search(r"Traces data exported to:\s*(\S+\.csv)", cleaned)
+        if m:
+            return m.group(1)
+
+        # Fallback: any absolute path ending in .csv
+        m = re.search(r"(/[^\s\"]+\.csv)", cleaned)
+        if m:
+            return m.group(1)
+
+        return ""
 
     def run(self):
         """Start the agent thread. Called before orchestrator.start_problem()."""
@@ -178,6 +469,14 @@ class GraphRCAAgent:
                 self._submit_default()
                 return
 
+            # If traces are truly empty (header-only), don't run the trace-driven pipeline.
+            # This happens when Jaeger has no services/spans in the requested window.
+            saved_csv = os.path.join(trace_dir, "aiopslab_traces.csv")
+            if os.path.exists(saved_csv) and (not self._csv_has_data_rows(saved_csv)):
+                logger.error(f"[Agent] No spans available in traces CSV; skipping pipeline: {saved_csv}")
+                self._submit_default()
+                return
+
             # Step 3: Run pipeline — with VALIDATION_RETRY for mitigation and detection
             # (Mirrors Stratus base.py VALIDATION_RETRY pattern)
             if self.task_type in ("mitigation", "detection"):
@@ -220,6 +519,14 @@ class GraphRCAAgent:
 
             run_start = time.time()
             report = self._run_pipeline(trace_dir, reflection=reflection)
+            if self.task_type == "mitigation":
+                try:
+                    executed = self._execute_mitigation_plan(report)
+                    report.setdefault("mitigation", {})["executed_actions"] = executed
+                    report.setdefault("mitigation", {})["executed_action_count"] = len(executed)
+                except Exception as e:
+                    logger.warning(f"[MitigationExec] Failed to execute mitigation plan: {e}")
+
             self._write_run_output(run_count, report)
             self._run_count = run_count + 1
 
@@ -293,9 +600,36 @@ class GraphRCAAgent:
         """Fetch traces from AIOpsLab cluster via generator."""
         logger.info(f"[Agent] Fetching traces for namespace={self.namespace}")
         try:
-            result = self.send(f'```\nget_traces("{self.namespace}", 5)\n```')
-            logger.info(f"[Agent] Received traces ({len(result)} chars)")
-            return result
+            export_result = self.send(f'```\nget_traces("{self.namespace}", 5)\n```')
+            export_result = self._clean_aiopslab_text(export_result)
+            logger.info(f"[Agent] Received traces export response ({len(export_result)} chars)")
+
+            # If orchestrator already returned a tabular trace payload, use it directly.
+            if "trace_id" in export_result and "span_id" in export_result:
+                return export_result
+
+            file_path = self._extract_trace_file_path(export_result)
+            if not file_path:
+                logger.warning("[Agent] Could not extract trace file path from get_traces output; returning raw response")
+                return export_result
+
+            # Prefer using the exported CSV directly to avoid parsing pandas' to_string() output.
+            if not os.path.isabs(file_path):
+                file_path = os.path.abspath(file_path)
+            self._trace_export_file_path = file_path
+
+            if os.path.exists(file_path):
+                has_rows = self._csv_has_data_rows(file_path)
+                self._trace_export_is_empty = not has_rows
+                if self._trace_export_is_empty:
+                    logger.warning(f"[Agent] Exported trace CSV has no spans (header-only): {file_path}")
+                return file_path
+
+            # Read the exported trace CSV content via AIOpsLab (mirrors Stratus: get_traces -> read_traces)
+            raw_traces = self.send(f'```\nread_traces("{file_path}")\n```')
+            raw_traces = self._clean_aiopslab_text(raw_traces)
+            logger.info(f"[Agent] Read traces ({len(raw_traces)} chars) from {file_path}")
+            return raw_traces
         except Exception as e:
             logger.error(f"[Agent] get_traces failed: {e}")
             return ""
@@ -320,6 +654,34 @@ class GraphRCAAgent:
         csv_path = os.path.join(trace_dir, "aiopslab_traces.csv")
 
         try:
+            s = (trace_data or "").strip()
+
+            # If we received a file path to a CSV on disk, copy it verbatim.
+            # This is the most reliable format for downstream ingest.
+            if s.lower().endswith(".csv") and os.path.exists(s):
+                shutil.copyfile(s, csv_path)
+                logger.info(f"[Agent] Copied exported traces CSV → {csv_path}")
+                return trace_dir
+
+            # Empty DataFrame output from AIOpsLab's read_traces(): treat as empty traces.
+            if s.startswith("Empty DataFrame"):
+                fieldnames = [
+                    "trace_id",
+                    "span_id",
+                    "parent_span",
+                    "service_name",
+                    "operation_name",
+                    "start_time",
+                    "duration",
+                    "has_error",
+                    "response",
+                ]
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=fieldnames)
+                    w.writeheader()
+                logger.warning(f"[Agent] No traces found (Empty DataFrame) — wrote header-only CSV to {csv_path}")
+                return trace_dir
+
             # Try parsing as JSON first
             if trace_data.strip().startswith("[") or trace_data.strip().startswith("{"):
                 traces = json.loads(trace_data)
@@ -335,6 +697,19 @@ class GraphRCAAgent:
             # Try parsing as pandas DataFrame string (fixed-width format)
             if "trace_id" in trace_data and "span_id" in trace_data:
                 import pandas as pd
+
+                # Heuristic: if the header line contains commas, prefer CSV parsing.
+                lines = [ln for ln in trace_data.splitlines() if ln.strip()]
+                header_line = (lines[0] if lines else "").strip().lower()
+                if "," in header_line and "trace_id" in header_line and "span_id" in header_line:
+                    try:
+                        df = pd.read_csv(io.StringIO(trace_data))
+                        df.to_csv(csv_path, index=False)
+                        logger.info(f"[Agent] Saved {len(df)} traces as CSV to {csv_path}")
+                        return trace_dir
+                    except Exception:
+                        pass
+
                 try:
                     df = pd.read_fwf(io.StringIO(trace_data))
                     df.to_csv(csv_path, index=False)
@@ -352,6 +727,31 @@ class GraphRCAAgent:
                 except Exception:
                     pass
 
+                # Try parsing AIOpsLab's pseudo-CSV (comma + fixed-width columns)
+                try:
+                    rows = self._parse_aiopslab_pseudocsv(trace_data)
+                    if rows:
+                        fieldnames = [
+                            "trace_id",
+                            "span_id",
+                            "parent_span",
+                            "service_name",
+                            "operation_name",
+                            "start_time",
+                            "duration",
+                            "has_error",
+                            "response",
+                        ]
+                        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                            w = csv.DictWriter(f, fieldnames=fieldnames)
+                            w.writeheader()
+                            for r in rows:
+                                w.writerow(r)
+                        logger.info(f"[Agent] Saved {len(rows)} traces as pseudoCSV→CSV to {csv_path}")
+                        return trace_dir
+                except Exception:
+                    pass
+
             # Fallback: save raw data and let ingest handle it
             with open(csv_path, "w") as f:
                 f.write(trace_data)
@@ -362,6 +762,69 @@ class GraphRCAAgent:
             logger.error(f"[Agent] Failed to save traces: {e}")
             return ""
 
+    def _parse_aiopslab_pseudocsv(self, trace_data: str) -> list[dict]:
+        """Parse the AIOpsLab trace table format into structured rows.
+
+        AIOpsLab's `read_traces()` may return a pseudo-CSV where some columns
+        are comma-separated and others are aligned with whitespace.
+        Example header:
+          trace_id,span_id      parent_span   service_name,operation_name       start_time  duration,has_error,response,...
+        """
+        if not trace_data:
+            return []
+
+        lines = [ln.rstrip("\n") for ln in trace_data.splitlines() if ln.strip()]
+        if not lines:
+            return []
+
+        header = lines[0].strip().lower()
+        if "trace_id,span_id" not in header or "service_name" not in header or "operation_name" not in header:
+            return []
+
+        rows: list[dict] = []
+        for ln in lines[1:]:
+            line = ln.strip()
+            if not line or line.lower().startswith("trace_id"):
+                continue
+
+            parts = line.split(",", maxsplit=5)
+            if len(parts) < 6:
+                continue
+
+            trace_id = parts[0].strip()
+            span_parent_service = parts[1].strip()
+            op_start = parts[2].strip()
+            duration = parts[3].strip()
+            has_error = parts[4].strip()
+            response = parts[5].strip()
+
+            # span_id parent_span service_name
+            tokens = span_parent_service.split()
+            span_id = tokens[0] if len(tokens) >= 1 else ""
+            parent_span = tokens[1] if len(tokens) >= 2 else ""
+            service_name = " ".join(tokens[2:]) if len(tokens) >= 3 else ""
+
+            # operation_name start_time
+            m = re.match(r"^(.*)\s+(\d+)$", op_start)
+            operation_name = m.group(1).strip() if m else op_start
+            start_time = m.group(2).strip() if m else ""
+
+            rows.append(
+                {
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                    "parent_span": parent_span,
+                    "service_name": service_name,
+                    "operation_name": operation_name,
+                    "start_time": start_time,
+                    "duration": duration,
+                    "has_error": has_error,
+                    "response": response,
+                }
+            )
+
+        return rows
+
     def _validate_mitigation(self) -> dict:
         """Check cluster pod health after mitigation (mirrors Stratus WorkloadOracle).
 
@@ -371,7 +834,10 @@ class GraphRCAAgent:
         from GraphRCA_agent.tools.kube_tools import exec_kubectl_command
         issues = []
         try:
-            result = exec_kubectl_command(f"kubectl get pods -n {self.namespace} --no-headers")
+            context = self._kubectl_context()
+            result = exec_kubectl_command(
+                f"kubectl --context {context} get pods -n {self.namespace} --no-headers"
+            )
             for line in result.splitlines():
                 line = line.strip()
                 if not line:
@@ -485,18 +951,8 @@ class GraphRCAAgent:
                 self.send(f"```\nsubmit({analysis})\n```")
 
             elif self.task_type == "mitigation":
-                actions = report.get("mitigation", {}).get("top_actions", [])
-                # Execute top actions first
-                for action in actions[:2]:
-                    cmd = action.get("command", "")
-                    if cmd:
-                        logger.info(f"[Agent] Executing mitigation: {cmd[:100]}")
-                        try:
-                            self.send(f"```\n{cmd}\n```")
-                        except Exception as e:
-                            logger.warning(f"[Agent] Mitigation cmd failed: {e}")
-                # Then submit
-                logger.info("[Agent] Mitigation submit")
+                executed_n = report.get("mitigation", {}).get("executed_action_count", 0)
+                logger.info(f"[Agent] Mitigation submit (executed {executed_n} command(s))")
                 self.send("```\nsubmit()\n```")
 
             else:

@@ -11,7 +11,8 @@ from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-from stratus.pipeline.tools.graph_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.graph_tools import (
     build_dag,
     add_node_with_metrics,
     detect_cycles,

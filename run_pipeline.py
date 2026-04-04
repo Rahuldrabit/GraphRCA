@@ -3,16 +3,16 @@
 
 Usage:
   # Standalone (trace CSV files)
-  python -m GraphRCA.run_pipeline --trace-dir ./stratus/trace_output
+    python -m GraphRCA_agent.run_pipeline --trace-dir ./trace_output
 
   # Without Neo4j
-  python -m GraphRCA.run_pipeline --trace-dir ./stratus/trace_output --no-neo4j
+    python -m GraphRCA_agent.run_pipeline --trace-dir ./trace_output --no-neo4j
 
   # AIOpsLab benchmark mode
-  python -m GraphRCA.run_pipeline --aiopslab --problem-id misconfig_app_hotel_res-detection-1
+    python -m GraphRCA_agent.run_pipeline --aiopslab --problem-id misconfig_app_hotel_res-detection-1
 
   # Verbose
-  python -m GraphRCA.run_pipeline --trace-dir ./stratus/trace_output -v
+    python -m GraphRCA_agent.run_pipeline --trace-dir ./trace_output -v
 """
 
 import argparse
@@ -82,9 +82,33 @@ def clear_neo4j() -> bool:
             before = session.run("MATCH (n) RETURN count(n) AS cnt").single()["cnt"]
             rels   = session.run("MATCH ()-[r]->() RETURN count(r) AS cnt").single()["cnt"]
             logging.info(f"Neo4j before clear: {before} nodes, {rels} relationships")
+
+            try:
+                from GraphRCA_agent.trace_logger import trace_event
+
+                trace_event(
+                    "neo4j.clear.start",
+                    tool="neo4j",
+                    nodes_before=before,
+                    relationships_before=rels,
+                )
+            except Exception:
+                pass
+
             session.run("MATCH (n) DETACH DELETE n")
             after = session.run("MATCH (n) RETURN count(n) AS cnt").single()["cnt"]
             logging.info(f"Neo4j cleared: {after} nodes remaining")
+
+            try:
+                from GraphRCA_agent.trace_logger import trace_event
+
+                trace_event(
+                    "neo4j.clear.end",
+                    tool="neo4j",
+                    nodes_after=after,
+                )
+            except Exception:
+                pass
         driver.close()
         return True
     except Exception as e:
@@ -99,9 +123,9 @@ def get_neo4j_connector():
         logging.info("Neo4j disabled (NEO4J_ENABLED != True)")
         return None
     try:
-        from stratus.tools.knowledge_graph.neo4j_connector import get_neo4j_connector as _get
+        from GraphRCA_agent.tools.pipeline.neo4j_connector import get_neo4j_connector as _get
         connector = _get()
-        if connector.is_available():
+        if connector and connector.is_available():
             logging.info("Neo4j connector available")
             return connector
         return None
@@ -142,6 +166,19 @@ def run_pipeline(
     # Configure LLM justification logging
     from GraphRCA_agent.llm import set_llm_log_dir
     set_llm_log_dir(output_dir)
+
+    # Configure structured trace logging (tool calls, Neo4j, etc.)
+    from GraphRCA_agent.trace_logger import set_trace_log_dir, trace_event
+    set_trace_log_dir(output_dir)
+    trace_event(
+        "pipeline.start",
+        caller="run_pipeline",
+        trace_dir=trace_dir,
+        output_dir=output_dir,
+        use_neo4j=use_neo4j,
+        store_spans=store_spans,
+        verbose=verbose,
+    )
 
     logger = logging.getLogger("graphrca.runner")
 
@@ -203,6 +240,14 @@ def run_pipeline(
 
     elapsed = round(time.time() - pipeline_start, 2)
 
+    trace_event(
+        "pipeline.end",
+        caller="run_pipeline",
+        status=final_state.get("status", "unknown"),
+        elapsed_seconds=elapsed,
+        error=final_state.get("error", ""),
+    )
+
     # Print message log
     for msg in final_state.get("messages", []):
         logger.info(f"  {msg}")
@@ -222,6 +267,27 @@ def run_pipeline(
         t = a.title if hasattr(a, "title") else a.get("title", "")
         c = a.command if hasattr(a, "command") else a.get("command", "")
         top_actions.append({"priority": p, "title": t, "command": c[:120]})
+
+    def _action_to_dict(a):
+        if a is None:
+            return {}
+        if isinstance(a, dict):
+            return a
+        # Pydantic-style
+        if hasattr(a, "dict") and callable(getattr(a, "dict")):
+            try:
+                return a.dict()
+            except Exception:
+                pass
+        # Dataclass / object
+        if hasattr(a, "__dict__"):
+            try:
+                return dict(a.__dict__)
+            except Exception:
+                pass
+        return {"raw": str(a)}
+
+    full_actions = [_action_to_dict(a) for a in actions]
 
     report = {
         "incident_id": final_state.get("incident_id", "INC-unknown"),
@@ -261,6 +327,7 @@ def run_pipeline(
         "mitigation": {
             "action_count": len(actions),
             "top_actions": top_actions,
+            "actions": full_actions,
         },
         "memory": {
             "similar_cases_found": len(final_state.get("similar_cases", [])),
@@ -335,6 +402,17 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
     from GraphRCA_agent.llm import set_llm_log_dir
     set_llm_log_dir(output_dir)
 
+    # Configure structured trace logging (tool calls, Neo4j, etc.)
+    from GraphRCA_agent.trace_logger import set_trace_log_dir, trace_event
+    set_trace_log_dir(output_dir)
+    trace_event(
+        "aiopslab.start",
+        caller="run_aiopslab",
+        problem_id=problem_id,
+        output_dir=output_dir,
+        verbose=verbose,
+    )
+
     logger = logging.getLogger("graphrca.aiopslab")
 
     logger.info("=" * 70)
@@ -390,6 +468,14 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
 
     agent.finalize()
 
+    trace_event(
+        "aiopslab.end",
+        caller="run_aiopslab",
+        problem_id=problem_id,
+        elapsed_seconds=total_elapsed,
+        task_type=task_type,
+    )
+
     # ── Extract AIOpsLab evaluation results ──────────────────────────────
     eval_results = {}
     try:
@@ -436,7 +522,15 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
 def _print_eval_banner(task_type: str, eval_results: dict, output_dir: str, agent):
     """Print evaluation results in the same format as Stratus run.log output."""
     # Validation result line
-    validation_success = eval_results.get("success", True)
+    validation_success = eval_results.get("success", None)
+    if validation_success is None:
+        # Detection tasks in AIOpsLab typically don't set a `success` key.
+        if task_type == "detection":
+            validation_success = eval_results.get("Detection Accuracy") == "Correct"
+        else:
+            # Default to True when the task doesn't define a success criterion.
+            validation_success = True
+    validation_success = bool(validation_success)
     validation_issues = eval_results.get("issues", [])
     print(f"\nValidation result: {{'success': {validation_success}, 'issues': {validation_issues}}}")
     if validation_success:
@@ -460,7 +554,11 @@ def _print_eval_banner(task_type: str, eval_results: dict, output_dir: str, agen
     }
     accuracy_key, time_key = metric_map.get(task_type, ("Accuracy", "Time"))
 
-    accuracy_val = eval_results.get(accuracy_key, eval_results.get("Detection Accuracy", "N/A"))
+    if task_type == "mitigation":
+        # Mitigation problems set `success` boolean.
+        accuracy_val = bool(eval_results.get("success", False))
+    else:
+        accuracy_val = eval_results.get(accuracy_key, "N/A")
     if task_type == "detection":
         correct = "Yes" if accuracy_val == "Correct" else "No"
         print(f"Correct detection: {correct}")
@@ -495,13 +593,13 @@ def main():
         epilog="""
 Examples:
   # Run on trace CSV files (no Neo4j)
-  python -m GraphRCA.run_pipeline --trace-dir ./stratus/trace_output --no-neo4j
+    python -m GraphRCA_agent.run_pipeline --trace-dir ./trace_output --no-neo4j
 
   # Run with Neo4j and verbose logging
-  python -m GraphRCA.run_pipeline --trace-dir ./stratus/trace_output -v
+    python -m GraphRCA_agent.run_pipeline --trace-dir ./trace_output -v
 
   # AIOpsLab benchmark mode
-  python -m GraphRCA.run_pipeline --aiopslab --problem-id misconfig_app_hotel_res-detection-1
+    python -m GraphRCA_agent.run_pipeline --aiopslab --problem-id misconfig_app_hotel_res-detection-1
         """,
     )
 

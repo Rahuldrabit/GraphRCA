@@ -3,7 +3,7 @@
 Parses raw CSV trace files, deduplicates spans, validates schema,
 and computes per-service statistics.
 
-Reuses Stratus pipeline ingest_tools directly.
+Uses GraphRCA's own pipeline tools (follows Stratus methodology).
 """
 
 import logging
@@ -12,8 +12,8 @@ from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-# Reuse existing Stratus ingest tools
-from stratus.pipeline.tools.ingest_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.ingest_tools import (
     parse_csv_directory,
     deduplicate_spans,
     validate_schema,

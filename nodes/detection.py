@@ -10,7 +10,8 @@ from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-from stratus.pipeline.tools.detection_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.detection_tools import (
     compute_ewma_baseline,
     detect_all_anomalies,
 )

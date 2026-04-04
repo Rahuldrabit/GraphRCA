@@ -4,16 +4,18 @@ Handles two sub-actions:
   1. memory_search — find similar past incidents before RCA
   2. memory_store  — persist incident record after full analysis
 
-Uses the SQLite-based MemoryStore from Stratus pipeline tools.
+Uses GraphRCA's own SQLite-based MemoryStore.
 """
 
 import logging
+import os
 import time
 from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-from stratus.pipeline.tools.memory_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.memory_tools import (
     MemoryStore,
     load_similar_cases,
     embed_incident,
@@ -27,10 +29,17 @@ logger = logging.getLogger(__name__)
 _memory_store: MemoryStore | None = None
 
 
-def _get_memory_store() -> MemoryStore:
+def _get_memory_store(output_dir: str | None = None) -> MemoryStore:
     global _memory_store
+
+    # Prefer explicit env var, else default to a per-run DB under output_dir.
+    db_path = os.getenv("SQLITE_DB_PATH") or os.getenv("GRAPHRCA_SQLITE_DB_PATH") or ""
+    db_path = db_path.strip().strip('"').strip("'")
+    if not db_path and output_dir:
+        db_path = os.path.join(output_dir, "memory.sqlite")
+
     if _memory_store is None:
-        _memory_store = MemoryStore()
+        _memory_store = MemoryStore(db_path=db_path or None)
     return _memory_store
 
 
@@ -50,7 +59,7 @@ def memory_search_node(state: PipelineState) -> Dict[str, Any]:
     logger.info(f"[MemorySearch] Searching for incidents similar to {error_svc}")
 
     try:
-        store = _get_memory_store()
+        store = _get_memory_store(state.get("output_dir"))
 
         # Build anomaly type string from alerts
         anomaly_type = "+".join(
@@ -112,7 +121,7 @@ def memory_store_node(state: PipelineState) -> Dict[str, Any]:
     logger.info(f"[MemoryStore] Storing incident {incident_id}")
 
     try:
-        store = _get_memory_store()
+        store = _get_memory_store(state.get("output_dir"))
 
         # Top cause
         top_cause = ranked_causes[0] if ranked_causes else None

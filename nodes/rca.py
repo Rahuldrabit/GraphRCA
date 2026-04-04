@@ -11,7 +11,8 @@ from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-from stratus.pipeline.tools.rca_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.rca_tools import (
     backward_bfs_traversal,
     score_candidate,
     infer_silent_failures,

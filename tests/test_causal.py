@@ -1,10 +1,9 @@
 """Unit tests for causal_tools (Pillar 2 — Causal Inference)."""
 
-import pytest
 import numpy as np
 from unittest.mock import MagicMock
 
-from GraphRCA.tools.causal_tools import (
+from GraphRCA_agent.tools.causal_tools import (
     temporal_order_analysis,
     causal_score,
     compute_pairwise_causal_scores,

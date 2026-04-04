@@ -11,7 +11,8 @@ from typing import Any, Dict
 from GraphRCA_agent.state import PipelineState
 from GraphRCA_agent.tools.safety_tools import UndoStack, build_undo_entry
 
-from stratus.pipeline.tools.mitigation_tools import (
+# Use GraphRCA's own pipeline tools
+from GraphRCA_agent.tools.pipeline.mitigation_tools import (
     generate_mitigation_plan,
     request_human_approval,
 )
