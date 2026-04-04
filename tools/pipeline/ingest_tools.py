@@ -36,16 +36,72 @@ def parse_csv_directory(trace_dir: str) -> List[Dict[str, Any]]:
         logger.warning(f"No CSV files found in {trace_dir}")
         return spans
     
-    def _looks_like_aiopslab_pseudocsv(header_line: str) -> bool:
+    def _looks_like_aiopslab_header(header_line: str) -> bool:
+        """Heuristic for AIOpsLab-provided trace export headers.
+
+        Note: AIOpsLab may provide either a standard comma-delimited CSV or a
+        pseudo-CSV where data rows are mixed comma + fixed-width fields.
+        We must not decide solely based on the header.
+        """
         h = (header_line or "").strip().lower()
         return (
-            "trace_id,span_id" in h
+            "trace_id" in h
+            and "span_id" in h
             and "parent_span" in h
             and "service_name" in h
             and "operation_name" in h
+            and "start_time" in h
             and "duration" in h
             and "has_error" in h
+            and "response" in h
         )
+
+    def _choose_aiopslab_parsing_mode(file_obj) -> str:
+        """Return 'standard' or 'pseudo' based on sampling the first data rows."""
+        try:
+            header_line = file_obj.readline()
+            if not header_line:
+                return "standard"
+
+            if not _looks_like_aiopslab_header(header_line):
+                return "standard"
+
+            header_cols = next(csv.reader([header_line.strip()]))
+            header_len = len(header_cols)
+
+            # Sample a few non-empty, non-header lines to see if they match the header width.
+            sample_pos = file_obj.tell()
+            for _ in range(25):
+                line = file_obj.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if not s or s.lower().startswith("trace_id"):
+                    continue
+
+                try:
+                    row = next(csv.reader([s]))
+                except Exception:
+                    continue
+
+                # If the row matches the header length, it's a normal CSV.
+                if header_len and len(row) == header_len:
+                    file_obj.seek(0)
+                    return "standard"
+
+                # The pseudo-CSV row format used by our parser has exactly 6 comma fields.
+                if len(row) == 6 and header_len >= 8:
+                    file_obj.seek(0)
+                    return "pseudo"
+
+            # Default: standard (safer; DictReader will ignore malformed rows rather than corrupt fields).
+            file_obj.seek(0)
+            return "standard"
+        finally:
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
 
     def _parse_aiopslab_pseudocsv_row(line: str) -> Dict[str, str] | None:
         s = (line or "").strip()
@@ -88,9 +144,10 @@ def parse_csv_directory(trace_dir: str) -> List[Dict[str, Any]]:
         filepath = os.path.join(trace_dir, csv_file)
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                # AIOpsLab may provide a pseudo-CSV (mixed comma + fixed-width).
-                header = f.readline()
-                if _looks_like_aiopslab_pseudocsv(header):
+                mode = _choose_aiopslab_parsing_mode(f)
+                if mode == "pseudo":
+                    # AIOpsLab pseudo-CSV (mixed comma + fixed-width)
+                    header = f.readline()  # consume header
                     for line in f:
                         row = _parse_aiopslab_pseudocsv_row(line)
                         if not row:
@@ -98,15 +155,13 @@ def parse_csv_directory(trace_dir: str) -> List[Dict[str, Any]]:
                         span = _normalize_span(row)
                         if span:
                             spans.append(span)
-                    continue
-
-                # Standard CSV path
-                f.seek(0)
-                reader = csv.DictReader(f)
-                for row in reader:
-                    span = _normalize_span(row)
-                    if span:
-                        spans.append(span)
+                else:
+                    # Standard comma-delimited CSV
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        span = _normalize_span(row)
+                        if span:
+                            spans.append(span)
         except Exception as e:
             logger.error(f"Error parsing {csv_file}: {e}")
     

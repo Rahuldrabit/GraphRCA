@@ -286,9 +286,8 @@ def store_trace_spans_to_neo4j(spans: List[Any], neo4j_connector) -> Dict[str, i
             neo4j_connector.execute_write(
                 """
                 UNWIND $spans AS sp
-                MERGE (span:Span {span_id: sp.span_id})
-                SET span.trace_id = sp.trace_id,
-                    span.service_name = sp.service_name,
+                MERGE (span:Span {trace_id: sp.trace_id, span_id: sp.span_id})
+                SET span.service_name = sp.service_name,
                     span.operation_name = sp.operation_name,
                     span.start_time = sp.start_time,
                     span.duration = sp.duration,
@@ -312,7 +311,7 @@ def store_trace_spans_to_neo4j(spans: List[Any], neo4j_connector) -> Dict[str, i
 
     span_ids = {r["span_id"] for r in span_records}
     child_of_pairs = [
-        {"child_id": r["span_id"], "parent_id": r["parent_span"]}
+        {"trace_id": r["trace_id"], "child_id": r["span_id"], "parent_id": r["parent_span"]}
         for r in span_records
         if r.get("parent_span") and r["parent_span"] != "ROOT" and r["parent_span"] in span_ids
     ]
@@ -323,8 +322,8 @@ def store_trace_spans_to_neo4j(spans: List[Any], neo4j_connector) -> Dict[str, i
             neo4j_connector.execute_write(
                 """
                 UNWIND $pairs AS p
-                MATCH (child:Span {span_id: p.child_id})
-                MATCH (parent:Span {span_id: p.parent_id})
+                MATCH (child:Span {trace_id: p.trace_id, span_id: p.child_id})
+                MATCH (parent:Span {trace_id: p.trace_id, span_id: p.parent_id})
                 MERGE (child)-[:CHILD_OF]->(parent)
                 """,
                 {"pairs": batch},

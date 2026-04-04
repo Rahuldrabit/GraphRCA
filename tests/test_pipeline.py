@@ -112,3 +112,90 @@ def test_health_score_computed():
 
     # health_score_before should be a non-negative float
     assert report["summary"]["health_score_before"] >= 0.0
+
+
+def test_ingest_parses_standard_aiopslab_csv_multi_service():
+    """Regression: do not mis-detect normal AIOpsLab CSV as pseudo-CSV."""
+    trace_dir = create_trace_dir()
+
+    from GraphRCA_agent.tools.pipeline.ingest_tools import parse_csv_directory, compute_stats
+
+    spans = parse_csv_directory(trace_dir)
+    assert len(spans) > 0
+
+    stats = compute_stats(spans)
+    # Our synthetic CSV has multiple distinct services.
+    assert len(stats) >= 4
+    assert "frontend" in stats
+    assert "api-gateway" in stats
+    assert "postgres" in stats
+
+
+def test_ingest_parses_aiopslab_pseudocsv_rows():
+    """Ensure pseudo-CSV path still works for mixed-format rows."""
+    import tempfile
+
+    header = "trace_id,span_id,parent_span,service_name,operation_name,start_time,duration,has_error,response\n"
+    # Pseudo-CSV data row format expected by _parse_aiopslab_pseudocsv_row:
+    # trace_id, "<span_id> <parent_span> <service_name>", "<operation_name> <start_time>", duration, has_error, response
+    row1 = "t1,s1 ROOT nginx-web-server,/wrk2-api/post/compose 1000000,10460,True,500\n"
+    row2 = "t1,s2 s1 compose-post-service,compose_post_server 1001000,5786,False,Unknown\n"
+
+    tmpdir = tempfile.mkdtemp()
+    fname = os.path.join(tmpdir, "pseudo.csv")
+    with open(fname, "w") as f:
+        f.write(header)
+        f.write(row1)
+        f.write(row2)
+
+    from GraphRCA_agent.tools.pipeline.ingest_tools import parse_csv_directory, compute_stats
+
+    spans = parse_csv_directory(tmpdir)
+    assert len(spans) == 2
+
+    stats = compute_stats(spans)
+    assert "nginx-web-server" in stats
+    assert "compose-post-service" in stats
+
+
+def test_detection_does_not_alert_on_unknown_only_signal():
+    """Regression: do not flag services only because response is 'Unknown'.
+
+    AIOpsLab gRPC spans often show response=Unknown even when healthy.
+    """
+    import tempfile
+
+    header = "trace_id,span_id,parent_span,service_name,operation_name,start_time,duration,has_error,response\n"
+    # 2 services, stable durations, no errors, but response is Unknown.
+    rows = [
+        "t1,s1,ROOT,svc-a,/svc.A/Method,1000000,1000,False,Unknown\n",
+        "t1,s2,s1,svc-b,/svc.B/Method,1000100,1000,False,Unknown\n",
+        "t2,s3,ROOT,svc-a,/svc.A/Method,2000000,1000,False,Unknown\n",
+        "t2,s4,s3,svc-b,/svc.B/Method,2000100,1000,False,Unknown\n",
+    ]
+
+    tmpdir = tempfile.mkdtemp()
+    fname = os.path.join(tmpdir, "unknown_only.csv")
+    with open(fname, "w") as f:
+        f.write(header)
+        for r in rows:
+            f.write(r)
+
+    from GraphRCA_agent.tools.pipeline.ingest_tools import parse_csv_directory, compute_stats
+    from GraphRCA_agent.tools.pipeline.detection_tools import compute_ewma_baseline, detect_all_anomalies
+
+    spans = parse_csv_directory(tmpdir)
+    assert len(spans) == 4
+
+    stats = compute_stats(spans)
+    baselines = compute_ewma_baseline(spans, alpha=0.3, window_size=100)
+
+    alerts = detect_all_anomalies(
+        spans=spans,
+        service_stats=stats,
+        baselines=baselines,
+        z_threshold=3.0,
+        error_threshold=0.05,
+    )
+
+    assert len(alerts) == 0

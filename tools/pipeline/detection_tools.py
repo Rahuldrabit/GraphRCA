@@ -52,6 +52,32 @@ def _duration_ms(span: Any) -> float:
     return 0.0
 
 
+def _operation_name(span: Any) -> str:
+    if hasattr(span, "operation_name"):
+        return str(getattr(span, "operation_name") or "").strip()
+    if isinstance(span, dict):
+        return str(span.get("operation_name") or span.get("operation") or "").strip()
+    return ""
+
+
+def _is_request_span(span: Any) -> bool:
+    """Best-effort: identify request-handler spans.
+
+    - gRPC server spans often look like: "/rate.Rate/GetRates"
+    - HTTP server spans often look like: "HTTP GET /path"
+
+    Internal spans (db/cache) usually don't match these patterns.
+    """
+    op = _operation_name(span)
+    if not op:
+        return False
+    if op.startswith("/"):
+        return True
+    if op.upper().startswith("HTTP "):
+        return True
+    return False
+
+
 @dataclass
 class EWMABaseline:
     service: str
@@ -87,13 +113,25 @@ def compute_ewma_baseline(
     window_size: int = 100,
 ) -> Dict[str, EWMABaseline]:
     """Calculate EWMA rolling average + std per service."""
-    service_durations: Dict[str, List[float]] = defaultdict(list)
+    # Prefer request-handler spans for baselines to avoid mixing wildly different
+    # internal operations (e.g., cache lookups) into a single service latency metric.
+    service_durations_req: Dict[str, List[float]] = defaultdict(list)
+    service_durations_all: Dict[str, List[float]] = defaultdict(list)
 
     for span in sorted(spans, key=_start_time):
-        service_durations[_service_name(span)].append(_duration_ms(span))
+        svc = _service_name(span)
+        dur = _duration_ms(span)
+        service_durations_all[svc].append(dur)
+        if _is_request_span(span):
+            service_durations_req[svc].append(dur)
 
     baselines: Dict[str, EWMABaseline] = {}
-    for service, durations in service_durations.items():
+    # Use request durations when available; otherwise fall back to all spans.
+    all_services = set(service_durations_all.keys()) | set(service_durations_req.keys())
+    for service in sorted(all_services):
+        durations = service_durations_req.get(service, [])
+        if len(durations) < 2:
+            durations = service_durations_all.get(service, [])
         recent = durations[-window_size:]
         if len(recent) < 2:
             baselines[service] = EWMABaseline(
@@ -198,16 +236,36 @@ def detect_all_anomalies(
     baselines: Dict[str, EWMABaseline],
     z_threshold: float = 3.0,
     error_threshold: float = 0.05,
+    current_window_size: int = 10,
 ) -> List[AlertSignal]:
     """Run full anomaly detection across all services."""
     alerts: List[AlertSignal] = []
+
+    # Precompute per-service duration series for a consistent current metric.
+    service_durations_req: Dict[str, List[float]] = defaultdict(list)
+    service_durations_all: Dict[str, List[float]] = defaultdict(list)
+    for span in sorted(spans, key=_start_time):
+        svc = _service_name(span)
+        dur = _duration_ms(span)
+        service_durations_all[svc].append(dur)
+        if _is_request_span(span):
+            service_durations_req[svc].append(dur)
 
     for service, stats in service_stats.items():
         baseline = baselines.get(service)
         if not baseline:
             continue
 
-        current_mean = float(stats.get("duration_mean_ms", 0.0) or 0.0)
+        # Use recent request-span latency as the current value (falls back to all spans).
+        durations = service_durations_req.get(service, [])
+        if len(durations) < 2:
+            durations = service_durations_all.get(service, [])
+        if durations:
+            tail_n = max(1, min(int(current_window_size), len(durations)))
+            recent_tail = durations[-tail_n:]
+            current_mean = float(sum(recent_tail) / len(recent_tail))
+        else:
+            current_mean = float(stats.get("duration_mean_ms", 0.0) or 0.0)
         z = calculate_z_score(current_mean, baseline)
         error_rate = float(stats.get("error_rate", 0.0) or 0.0)
         unknown_pct = float(stats.get("unknown_response_pct", 0.0) or 0.0)
@@ -222,7 +280,11 @@ def detect_all_anomalies(
         if unknown_pct > 80:
             anomaly_types.append("unknown_response_gap")
 
-        if anomaly_types or anomaly_score > 0.3:
+        # Avoid false positives where the only signal is missing/unknown response
+        # classification (common for gRPC spans that don't carry HTTP status codes).
+        has_strong_signal = (abs(z) >= z_threshold) or (error_rate >= error_threshold)
+        has_meaningful_score = anomaly_score > 0.3
+        if (has_strong_signal or has_meaningful_score) and (anomaly_types or has_meaningful_score):
             anomaly_type = "+".join(anomaly_types) if anomaly_types else "multi_signal"
             alerts.append(
                 emit_alert_signal(
