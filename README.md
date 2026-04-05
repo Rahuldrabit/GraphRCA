@@ -1,8 +1,8 @@
-# GraphRCA — LangGraph Autonomous SRE Pipeline
+# GraphRCA — Autonomous SRE with Knowledge Graphs and an LLM Multi-Agent Pipeline
 
-A **standalone** multi-agent system for root cause analysis, anomaly detection, and autonomous mitigation in distributed systems. Implements the **STRATUS (NeurIPS 2025)** methodology pillars using a **LangGraph StateGraph** orchestration.
+A **standalone** multi-agent system for root cause analysis, anomaly detection, and autonomous mitigation in distributed systems.
 
-**GraphRCA is fully independent** - it follows the STRATUS methodology but has its own codebase and does not require the STRATUS repository.
+
 
 ## Architecture
 
@@ -22,6 +22,61 @@ trace_ingest → graph_builder → detection → memory_search
 | 4 — Benchmark | AIOpsLab integration (detection / localization / analysis / mitigation) | `agent_aiopslab` |
 
 ---
+
+## Methodology (How GraphRCA solves SRE tasks)
+
+GraphRCA follows a **trace-first** methodology: it ingests distributed traces, builds a service dependency graph, detects anomalous services, ranks root-cause candidates, and proposes mitigations with an explicit safety gate (TNR) and a rollback loop.
+
+### 1) Observations → normalized signals
+
+- **Trace ingestion**: parses spans (CSV in standalone mode, AIOpsLab traces in benchmark mode), validates required fields, and normalizes common attributes (service name, start time, duration, error flag).
+- **Service-level aggregation**: computes per-service stats (error rate, latency summary, span volume) that become inputs to later scoring.
+
+### 2) Build the knowledge graph (service dependency graph)
+
+- **Graph construction**: builds a directed graph of service-to-service calls (caller → callee) from traces.
+- **Structural priors**: computes PageRank-style centrality for services (used as a structural signal for reporting/analysis).
+
+### 3) Detection (answers “Is there an incident?”)
+
+- **Baseline**: computes an EWMA latency baseline per service.
+- **Alerting**: emits anomaly alerts when a service crosses z-score and/or error-rate thresholds; alert severity comes from a fused anomaly score.
+
+### 4) Memory retrieval (optional context before RCA)
+
+- **Similar-case lookup**: queries the local SQLite incident store for similar historical patterns (service + anomaly type signature).
+- **Goal**: provide context (e.g., known fixes / false-positive patterns) without changing the deterministic RCA logic.
+
+### 5) Localization / RCA ranking (answers “What is the root cause?”)
+
+- **Candidate discovery**: starts from the primary error service and performs a bounded backward BFS upstream on the dependency graph.
+- **Candidate scoring**: assigns each visited service a confidence score using a weighted fusion of error signal, latency z-score, alert score, span volume, and a small depth boost.
+- **Silent failure inference**: detects likely bottlenecks via “duration absorption” on call edges and boosts confidence for services that look like silent bottlenecks.
+
+### 6) Causal re-ranking (Pillar 2)
+
+- **Temporal ordering**: prefers services whose anomalies appear earlier in time.
+- **Lagged cross-correlation**: computes pairwise causal-strength estimates among top candidates (A → B) using lagged correlation of latency series.
+- **Fusion**: re-ranks candidates with `combined = α·BFS_confidence + β·temporal_priority + γ·causal_score`.
+
+### 7) Evidence enrichment (answers “Why?”)
+
+- **Log pattern analysis (Pillar 3)**: targets the top suspects and extracts log patterns / signatures to strengthen explanations.
+- **Fault tree reporting**: generates a compact fault-tree subgraph for the top-ranked candidates for human-readable reports.
+
+### 8) Mitigation planning (answers “What should we do?”)
+
+- **Action generation**: proposes a prioritized mitigation plan from the top-ranked candidates (and optionally from proven resolutions found in memory).
+- **Benchmark integration**: formats outputs for AIOpsLab/ITBench task schemas (detection/localization/analysis/mitigation).
+
+### 9) Safety gate + rollback loop (Pillar 1: TNR)
+
+- **TNR safety oracle**: computes a post-mitigation health score $\mu(s)$ and checks whether health regressed beyond tolerance.
+- **Transactional rollback**: if health regresses, GraphRCA executes an undo stack (rollback) and re-enters RCA (bounded number of cycles).
+
+### 10) Learning (store the incident)
+
+- **Incident storage**: persists the incident signature, root cause, confidence, evidence, and outcome in SQLite (and optionally links to Neo4j) to support future similarity retrieval.
 
 ## Project Structure
 
@@ -300,7 +355,7 @@ eval/04-03_14-30-00-misconfig_app_hotel_res-detection-1/
         └── remediation_struct_out.json
 ```
 
-At the end of each run, the terminal prints a Stratus-format evaluation banner:
+At the end of each run, the terminal prints a evaluation banner:
 
 ```
 Validation result: {'success': True, 'issues': []}
@@ -389,7 +444,7 @@ PYTHONPATH="$PWD" python -m GraphRCA_agent.run_pipeline --clear-neo4j
 
 ## AIOpsLab Integration Pattern
 
-GraphRCA mirrors the Stratus `StratusAgent_AIOpsLab` threaded agent pattern:
+
 
 ```
 AIOpsLab Orchestrator
@@ -415,17 +470,91 @@ Task-type routing:
 
 ## Key Concepts
 
+### Ranking hyperparameters (defaults from code)
+
+This section documents the **exact default knobs currently used in ranking / scoring** as implemented in the code (many are hard-coded today).
+
+#### Graph / centrality
+
+- **PageRank damping (`alpha`)**: `0.85` (used when computing service structural centrality).
+
+Source: `tools/pipeline/graph_tools.py`.
+
+#### Detection → alert scoring (feeds RCA)
+
+- **EWMA baseline**: `alpha=0.3`, `window_size=100` (baseline for service latency).
+- **Anomaly detection thresholds**: `z_threshold=3.0`, `error_threshold=0.05`, `current_window_size=10`.
+- **Anomaly score fusion weights**: `0.40*z_component + 0.45*error_component + 0.15*unknown_penalty`.
+  - `z_component = min(1.0, |z|/10)` only when `|z| > 2.0`.
+  - `error_component = min(1.0, error_rate*2.0)`.
+  - `unknown_penalty = 0.2` when `unknown_pct > 80`.
+
+Source: `tools/pipeline/detection_tools.py` and `nodes/detection.py`.
+
+#### RCA candidate discovery + scoring
+
+- **Backward BFS traversal depth**: `max_depth=5`.
+- **Path explosion cap**: `max_paths=200`.
+- **Candidate confidence score** (per service):
+  - `error_component = min(1.0, error_rate*3.0)`
+  - `latency_component = min(1.0, |latency_z|/10)` only when `|latency_z| > 2.0`
+  - `depth_boost = min(0.15, traversal_depth*0.03)`
+  - `volume_score = min(1.0, span_count/max_span_count)`
+  - `alert_score = max(alert.score for alerts on service)`
+  - `confidence = 0.35*error_component + 0.35*latency_component + 0.15*alert_score + 0.10*volume_score + depth_boost`
+- **Latency z-score fallback**: if `baseline_std <= 0.001`, z-score becomes `10.0` when mean deviates by `> 0.001` (else `0.0`).
+
+Source: `tools/pipeline/rca_tools.py` and `nodes/rca.py`.
+
+#### Silent failure inference (adjusts RCA confidence)
+
+- **Absorption ratio cap**: `absorption = min(1.5, edge_avg_duration_ms / parent_duration_mean_ms)`.
+- **Verdicts**:
+  - `SILENT_BOTTLENECK` if `absorption >= 0.75` and `child_error_rate < 0.05`
+  - `POSSIBLE_BOTTLENECK` if `absorption >= 0.6`
+- **Silent bottleneck confidence boost**: `confidence *= 1.15` (capped to `1.0`).
+
+Source: `tools/pipeline/rca_tools.py` (inference) and `nodes/rca.py` (boost).
+
+#### Causal re-ranking (Pillar 2)
+
+- **Top candidates scored causally**: top `8` RCA candidates.
+- **Lag for cross-correlation**: `lag=5`.
+- **Combined re-rank fusion**: `combined = α·BFS_confidence + β·temporal_priority + γ·causal_score` with `α=0.50`, `β=0.25`, `γ=0.25`.
+
+Source: `tools/causal_tools.py` and `nodes/causal_ranker.py`.
+
+#### Downstream “top-N” cutoffs (uses ranking output)
+
+- **Log analysis suspects**: top `3` ranked causes.
+- **Mitigation planning**: uses top `3` ranked causes.
+- **Fault tree report**: uses top `5` ranked causes.
+
+Source: `nodes/rca.py`, `tools/pipeline/rca_tools.py`, `tools/pipeline/mitigation_tools.py`.
+
+#### TNR safety scoring (Pillar 1)
+
+- **Health score weights**: `μ(s) = 0.40·|alerts| + 0.35·|sla_violations| + 0.25·|unhealthy_nodes|`.
+- **Regression tolerance**: rollback triggers when `μ(s)_after > μ(s)_before + 0.05`.
+- **Max rollback cycles**: `3`.
+
+Source: `tools/safety_tools.py` and `nodes/undo_agent.py`.
+
 ### EWMA Anomaly Detection
-Exponential Weighted Moving Average baseline per service. Alerts triggered when z-score exceeds threshold. Severity: CRITICAL / HIGH / MEDIUM / LOW.
+Exponential Weighted Moving Average baseline per service. Alerts are emitted when service behavior deviates (z-score and/or error-rate thresholds), then a fused anomaly score determines severity: CRITICAL / HIGH / MEDIUM / LOW.
 
 ### Backward BFS RCA
-Root cause scored by 3 signals: `error_rate × 0.5 + latency_ratio × 0.3 + call_volume × 0.2`. BFS traversal walks upstream from the error service.
+Backward traversal walks **upstream** from the primary error service on the service dependency graph (bounded by `max_depth=5` and `max_paths=200`).
+
+Each candidate service gets a **multi-signal confidence score** (error, latency z-score, alert score, call volume, and a small depth boost), then candidates are sorted by `confidence` descending.
 
 ### TNR Rollback Loop (Pillar 1)
-After mitigation, health score is computed. If `health_score_after < health_score_before`, rollback is triggered and RCA restarts (up to 3 times).
+After mitigation, the weighted health score $\mu(s)$ is computed again. If health regresses (default: $\mu(s)_{after} > \mu(s)_{before} + 0.05$), rollback is triggered and RCA restarts (up to 3 times).
 
 ### Causal Ranking (Pillar 2)
-Impact formula: `confidence×0.4 + error_rate×0.3 + downstream_ratio×0.2 + call_volume×0.1`
+Re-ranks BFS results using a combined score:
+
+`combined = α·BFS_confidence + β·temporal_priority + γ·causal_score` (defaults: `α=0.50`, `β=0.25`, `γ=0.25`, `lag=5`, causal scoring on top `8` candidates).
 
 ---
 
@@ -483,12 +612,10 @@ See LICENSE file in repository root.
 
 ## Citation
 
-If you use GraphRCA in your research, please cite the STRATUS paper:
+If you use GraphRCA in your research, please cite the GraphRCA paper:
 
 ```bibtex
-@inproceedings{stratus2025,
-  title={STRATUS: Autonomous SRE with Transactional No-Regression},
-  booktitle={NeurIPS 2025},
-  year={2025}
+@inproceedings{GraphRCA,
+  title={GraphRCA: Autonomous SRE with Knowledge Graphs and an LLM Multi-Agent Pipeline},
 }
 ```

@@ -5,6 +5,7 @@ service dependency graph + multi-signal confidence scoring.
 """
 
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict
@@ -108,6 +109,31 @@ def rca_node(state: PipelineState) -> Dict[str, Any]:
         # Step 4: Rank
         ranked = rank_root_causes(candidates)
 
+        # Optional: let the LLM access the knowledge graph for candidate re-ranking.
+        # Off by default. Enable via GRAPHRCA_LLM_KG_MODE=a|b (see run_graphrca.sh prompt).
+        kg_mode = str(state.get("llm_kg_mode") or os.getenv("GRAPHRCA_LLM_KG_MODE", "")).strip().lower()
+        llm_kg_debug: Dict[str, Any] = {}
+        if kg_mode in {"a", "b"}:
+            try:
+                from GraphRCA_agent.tools.pipeline.kg_llm_tools import maybe_llm_rerank_with_kg
+
+                ranked, llm_kg_debug = maybe_llm_rerank_with_kg(
+                    kg_mode=kg_mode,
+                    G=G,
+                    error_service=error_service,
+                    ranked_causes=ranked,
+                    neo4j_connector=neo4j_connector,
+                )
+
+                if llm_kg_debug.get("applied"):
+                    logger.info(f"[RCA] LLM-KG({kg_mode}) applied re-ranking")
+                else:
+                    why = llm_kg_debug.get("reason") or llm_kg_debug.get("skipped") or llm_kg_debug.get("error")
+                    logger.info(f"[RCA] LLM-KG({kg_mode}) not applied: {why}")
+            except Exception as e:
+                logger.warning(f"[RCA] LLM-KG({kg_mode}) failed (non-fatal): {e}")
+                llm_kg_debug = {"enabled": True, "mode": kg_mode, "error": str(e)}
+
         # Step 5: Fault tree
         fault_tree = generate_fault_tree(ranked, G, error_service)
 
@@ -141,6 +167,7 @@ def rca_node(state: PipelineState) -> Dict[str, Any]:
             "bfs_paths": paths[:20],
             "silent_failures": silent_failures[:20],
             "suspect_services": suspect_services,
+            "llm_kg": llm_kg_debug,
             "status": "running",
             "messages": state.get("messages", []) + [
                 f"[RCA] Root causes: {' | '.join(top3_summary)} | incident={incident_id}"

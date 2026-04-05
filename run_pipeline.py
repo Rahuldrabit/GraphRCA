@@ -212,6 +212,7 @@ def run_pipeline(
         "use_neo4j": use_neo4j and neo4j_connector is not None,
         "neo4j_connector": neo4j_connector,
         "store_spans": store_spans,
+        "llm_kg_mode": os.getenv("GRAPHRCA_LLM_KG_MODE", "").strip().lower(),
         "output_dir": output_dir,
         "pipeline_start_time": time.time(),
         "status": "running",
@@ -320,6 +321,7 @@ def run_pipeline(
             ],
             "causal_scores": final_state.get("causal_scores", {}),
             "temporal_order": final_state.get("temporal_order", []),
+            "llm_kg": final_state.get("llm_kg", {}),
         },
         "log_analysis": {
             "clusters": final_state.get("log_clusters", []),

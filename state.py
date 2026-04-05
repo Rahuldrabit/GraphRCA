@@ -21,6 +21,7 @@ class PipelineState(TypedDict, total=False):
     neo4j_connector: Any
     store_spans: bool
     additional_context: str         # Reflection text from previous failed runs (VALIDATION_RETRY)
+    llm_kg_mode: str                # "a"|"b"|"" (experimental KG access for LLM)
 
     # ── Trace Ingest ───────────────────────────────────────────────────
     spans: list                     # List[Span]
@@ -47,6 +48,7 @@ class PipelineState(TypedDict, total=False):
     fault_tree: dict
     bfs_paths: list
     silent_failures: list
+    llm_kg: dict                    # Debug info from LLM KG mode (if enabled)
 
     # ── Causal Ranker (Pillar 2) ──────────────────────────────────────
     causal_scores: dict             # {service: causal_strength}

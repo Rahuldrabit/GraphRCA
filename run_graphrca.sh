@@ -181,6 +181,52 @@ info "  GraphRCA — LangGraph Autonomous SRE Pipeline"
 info "======================================================="
 info "Architecture: $ARCH"
 
+# ── Experimental: LLM Knowledge Graph Modes ─────────────────────────────────
+#
+# For testing/debugging you can let the LLM access the knowledge graph in 2 ways:
+#   a) Dump the full NetworkX graph JSON into the LLM prompt
+#   b) Neo4j GraphRAG: the LLM writes Cypher READ queries and we feed results back
+#
+# Selection is interactive (type 'a' or 'b') unless GRAPHRCA_LLM_KG_MODE is set.
+
+prompt_llm_kg_mode() {
+    # Respect a pre-set mode (e.g., exported by the user or CI).
+    if [[ -n "${GRAPHRCA_LLM_KG_MODE:-}" ]]; then
+        return 0
+    fi
+
+    # Only prompt when stdin is a TTY.
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+
+    echo ""
+    info "LLM knowledge graph mode (experimental):"
+    echo "  a) Full graph dump into prompt"
+    echo "  b) Neo4j GraphRAG (LLM writes Cypher queries)"
+    echo "  (Enter) Default (no KG access)"
+    read -r -p "Choose [a/b/Enter]: " KG_CHOICE
+
+    case "${KG_CHOICE}" in
+        a|A) export GRAPHRCA_LLM_KG_MODE="a" ;;
+        b|B) export GRAPHRCA_LLM_KG_MODE="b" ;;
+        *) export GRAPHRCA_LLM_KG_MODE="" ;;
+    esac
+}
+
+prompt_llm_kg_mode
+
+if [[ "${GRAPHRCA_LLM_KG_MODE:-}" == "a" ]]; then
+    info "LLM KG mode: a (graph dump)"
+elif [[ "${GRAPHRCA_LLM_KG_MODE:-}" == "b" ]]; then
+    info "LLM KG mode: b (Neo4j GraphRAG)"
+    if [[ "${NO_NEO4J:-}" == "--no-neo4j" ]]; then
+        warn "KG mode b selected but --no-neo4j was passed; GraphRAG will be skipped"
+    fi
+else
+    info "LLM KG mode: default (no KG access)"
+fi
+
 # ── Clear Neo4j ──────────────────────────────────────────────────────────────
 
 if [[ $CLEAR_NEO4J -eq 1 ]]; then
