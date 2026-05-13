@@ -49,6 +49,55 @@ def test_graph_compiles():
     assert app is not None
 
 
+def test_multi_agent_graph_compiles():
+    """Multi-agent StateGraph (Phase 3) compiles without error."""
+    from GraphRCA_agent.graph import build_multi_agent_graph
+    workflow = build_multi_agent_graph()
+    app = workflow.compile()
+    assert app is not None
+
+
+def test_dispatch_workers_router_returns_aggregate_when_no_assignments():
+    """dispatch_workers_router goes to aggregate_workers when strategy is empty."""
+    from GraphRCA_agent.nodes.planner_agent import dispatch_workers_router
+    state = {"investigation_strategy": {"worker_assignments": []}}
+    result = dispatch_workers_router(state)
+    assert result == "aggregate_workers"
+
+
+def test_dispatch_workers_router_returns_sends_for_valid_assignments():
+    """dispatch_workers_router returns Send objects for valid worker assignments."""
+    from GraphRCA_agent.nodes.planner_agent import dispatch_workers_router
+    from langgraph.types import Send
+    state = {
+        "investigation_strategy": {
+            "worker_assignments": [
+                {"mount": "kubectl", "tool": "exec_kubectl_cmd_safely", "arguments": {"cmd": "kubectl get pods"}},
+                {"mount": "prometheus", "tool": "query_prometheus", "arguments": {"query": "up"}},
+            ]
+        }
+    }
+    result = dispatch_workers_router(state)
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert all(isinstance(s, Send) for s in result)
+
+
+def test_dispatch_workers_router_skips_invalid_tasks():
+    """dispatch_workers_router skips entries missing mount or tool."""
+    from GraphRCA_agent.nodes.planner_agent import dispatch_workers_router
+    state = {
+        "investigation_strategy": {
+            "worker_assignments": [
+                {"mount": "", "tool": "exec_kubectl_cmd_safely"},   # missing mount
+                {"mount": "kubectl", "tool": ""},                   # missing tool
+            ]
+        }
+    }
+    result = dispatch_workers_router(state)
+    assert result == "aggregate_workers"
+
+
 def test_state_schema_importable():
     from GraphRCA_agent.state import PipelineState
     state: PipelineState = {

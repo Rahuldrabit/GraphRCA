@@ -3,9 +3,14 @@
 Builds a service dependency DAG from span parent-child relationships,
 enriches nodes with per-service metrics, computes PageRank, and
 optionally persists to Neo4j.
+
+Phase 2: When GRAPHRCA_INFRA_LAYER=true, adds a second infrastructure layer
+(Pod/K8sNode nodes and DEPLOYED_AS/RUNS_ON/COLOCATED edges) via kubectl.
 """
 
 import logging
+import os
+import re
 import time
 from typing import Any, Dict
 
@@ -61,11 +66,49 @@ def graph_builder_node(state: PipelineState) -> Dict[str, Any]:
         # 4. Compute PageRank (centrality)
         pagerank = compute_pagerank(G)
 
-        # 5. Export to JSON for logging/storage
-        graph_json = export_graph_json(G)
+        # 5. Export to JSON for logging/storage (result stored in graph_summary via neo4j path)
+        export_graph_json(G)
 
-        # 6. Persist to Neo4j
-        neo4j_summary = {}
+        # 6. Phase 2: Optional infrastructure topology layer
+        infra_topology: Dict[str, Any] = {}
+        noisy_neighbors: list = []
+        infra_layer_enabled = os.getenv("GRAPHRCA_INFRA_LAYER", "").lower() in ("1", "true")
+        if infra_layer_enabled:
+            try:
+                from GraphRCA_agent.tools.pipeline.infra_tools import (
+                    discover_infra_topology,
+                    build_infra_layer,
+                    detect_noisy_neighbors,
+                )
+                from GraphRCA_agent.tools.kube_tools import exec_kubectl_command
+
+                # Extract namespace from additional_context (same pattern as agent_aiopslab.py)
+                additional_context = state.get("additional_context", "") or ""
+                ns_match = re.search(
+                    r"namespace[:\s]+['\"]?([a-z0-9-]+)['\"]?",
+                    additional_context,
+                    re.IGNORECASE,
+                )
+                namespace = ns_match.group(1) if ns_match else "default"
+
+                infra_topology = discover_infra_topology(
+                    namespace=namespace,
+                    kubectl_fn=exec_kubectl_command,
+                )
+                current_alerts = state.get("alerts", [])
+                G = build_infra_layer(G, infra_topology, service_stats, alerts=current_alerts)
+                noisy_neighbors = detect_noisy_neighbors(G, infra_topology, alerts=current_alerts)
+                logger.info(
+                    f"[GraphBuilder] Infra layer added: "
+                    f"{len(infra_topology.get('pods', []))} pods, "
+                    f"{len(infra_topology.get('nodes', []))} nodes, "
+                    f"{len(noisy_neighbors)} noisy-neighbor pairs"
+                )
+            except Exception as infra_err:
+                logger.warning(f"[GraphBuilder] Infra layer failed (skipping): {infra_err}")
+
+        # 7. Persist to Neo4j
+        neo4j_summary: Dict[str, Any] = {}
         if use_neo4j and neo4j_connector:
             neo4j_summary = store_graph_to_neo4j(G, neo4j_connector)
             if store_spans:
@@ -79,6 +122,7 @@ def graph_builder_node(state: PipelineState) -> Dict[str, Any]:
             "cycles": len(cycles),
             "top_pagerank": dict(list(pagerank.items())[:5]),
             "neo4j": neo4j_summary,
+            "infra_layer_enabled": infra_layer_enabled,
             "_elapsed_seconds": elapsed,
         }
 
@@ -87,16 +131,20 @@ def graph_builder_node(state: PipelineState) -> Dict[str, Any]:
             f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges"
         )
 
-        return {
+        result: Dict[str, Any] = {
             "graph": G,
             "pagerank": pagerank,
             "graph_summary": graph_summary,
+            "infra_topology": infra_topology,
+            "noisy_neighbors": noisy_neighbors,
+            "infra_layer_enabled": infra_layer_enabled,
             "status": "running",
             "messages": state.get("messages", []) + [
                 f"[GraphBuilder] DAG: {G.number_of_nodes()} services, {G.number_of_edges()} call edges"
             ],
             "node_timings": {**state.get("node_timings", {}), "graph_builder": elapsed},
         }
+        return result
 
     except Exception as e:
         logger.exception(f"[GraphBuilder] Failed: {e}")

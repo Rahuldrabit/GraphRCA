@@ -174,8 +174,23 @@ def store_graph_to_neo4j(G: nx.DiGraph, neo4j_connector) -> Dict[str, int]:
     nodes_created = 0
     rels_created = 0
 
+    # Node label mapping for Phase 2 infra layer
+    _NODE_LABEL = {
+        "pod": "Pod",
+        "k8s_node": "K8sNode",
+    }
+    # Edge type → Cypher relationship type + node label pair
+    _EDGE_CYPHER = {
+        "DEPLOYED_AS": ("DEPLOYED_AS", "Service", "Pod"),
+        "RUNS_ON": ("RUNS_ON", "Pod", "K8sNode"),
+        "COLOCATED": ("COLOCATED", "Pod", "Pod"),
+    }
+
     for node_id in G.nodes():
         attrs = dict(G.nodes[node_id])
+        node_type = attrs.get("node_type", "service")
+        label = _NODE_LABEL.get(str(node_type).lower(), "Service")
+
         clean_attrs: Dict[str, Any] = {}
         for k, v in attrs.items():
             if isinstance(v, (list, set)):
@@ -185,10 +200,10 @@ def store_graph_to_neo4j(G: nx.DiGraph, neo4j_connector) -> Dict[str, int]:
 
         try:
             neo4j_connector.execute_write(
-                """
-                MERGE (s:Service {name: $name})
-                SET s += $props
-                SET s.updated_at = datetime()
+                f"""
+                MERGE (n:{label} {{name: $name}})
+                SET n += $props
+                SET n.updated_at = datetime()
                 """,
                 {"name": node_id, "props": clean_attrs},
             )
@@ -198,6 +213,7 @@ def store_graph_to_neo4j(G: nx.DiGraph, neo4j_connector) -> Dict[str, int]:
 
     for src, dst in G.edges():
         edge_attrs = dict(G.edges[src, dst])
+        etype = edge_attrs.get("edge_type", "CALLS")
         clean_attrs = {}
         for k, v in edge_attrs.items():
             if isinstance(v, (list, set)):
@@ -205,15 +221,28 @@ def store_graph_to_neo4j(G: nx.DiGraph, neo4j_connector) -> Dict[str, int]:
             elif isinstance(v, (int, float, str, bool)):
                 clean_attrs[k] = v
 
-        try:
-            neo4j_connector.execute_write(
-                """
+        if etype in _EDGE_CYPHER:
+            rel_type, src_label, dst_label = _EDGE_CYPHER[etype]
+            cypher = f"""
+                MATCH (s:{src_label} {{name: $src}})
+                MATCH (d:{dst_label} {{name: $dst}})
+                MERGE (s)-[r:{rel_type}]->(d)
+                SET r += $props
+                SET r.updated_at = datetime()
+            """
+        else:
+            # Default CALLS between Service nodes
+            cypher = """
                 MATCH (src:Service {name: $src})
                 MATCH (dst:Service {name: $dst})
                 MERGE (src)-[r:CALLS]->(dst)
                 SET r += $props
                 SET r.updated_at = datetime()
-                """,
+            """
+
+        try:
+            neo4j_connector.execute_write(
+                cypher,
                 {"src": src, "dst": dst, "props": clean_attrs},
             )
             rels_created += 1

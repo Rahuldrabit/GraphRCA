@@ -1,26 +1,29 @@
 """Detection Node — LangGraph agent node.
 
-Computes EWMA baselines and detects latency/error anomalies
-across all services. Implements multi-signal anomaly scoring.
+Computes baselines and detects latency/error anomalies across all services.
+
+Detector selection is controlled by GRAPHRCA_DETECTOR env var:
+  "ewma"             — always use EWMA (original behaviour, default)
+  "isolation_forest" — always use IsolationForest
+  "auto"             — use IF when len(spans) >= GRAPHRCA_IF_MIN_SAMPLES, else EWMA
+
+LLM contextual scoring is opt-in via GRAPHRCA_LLM_SCORER=true.
 """
 
 import logging
+import os
 import time
 from typing import Any, Dict
 
 from GraphRCA_agent.state import PipelineState
 
-# Use GraphRCA's own pipeline tools
-from GraphRCA_agent.tools.pipeline.detection_tools import (
-    compute_ewma_baseline,
-    detect_all_anomalies,
-)
-
 logger = logging.getLogger(__name__)
+
+_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 def detection_node(state: PipelineState) -> Dict[str, Any]:
-    """LangGraph node: EWMA anomaly detection across all services.
+    """LangGraph node: anomaly detection across all services.
 
     Reads:  spans, service_stats
     Writes: alerts, baselines, primary_error_service, health_score_before
@@ -29,7 +32,13 @@ def detection_node(state: PipelineState) -> Dict[str, Any]:
     spans = state.get("spans", [])
     service_stats = state.get("service_stats", {})
 
-    logger.info(f"[Detection] Running EWMA detection on {len(service_stats)} services")
+    detector_mode = os.getenv("GRAPHRCA_DETECTOR", "ewma").lower().strip()
+    use_llm_scorer = os.getenv("GRAPHRCA_LLM_SCORER", "").lower().strip() in _TRUTHY
+
+    logger.info(
+        f"[Detection] detector={detector_mode}, llm_scorer={use_llm_scorer}, "
+        f"services={len(service_stats)}"
+    )
 
     if not spans:
         return {
@@ -40,19 +49,23 @@ def detection_node(state: PipelineState) -> Dict[str, Any]:
         }
 
     try:
-        # 1. Compute EWMA baselines for each service
-        baselines = compute_ewma_baseline(spans, alpha=0.3, window_size=100)
+        from GraphRCA_agent.tools.pipeline.anomaly_detectors import get_detector
 
-        # 2. Run anomaly detection (multi-signal: z-score + error rate + unknown%)
-        alerts = detect_all_anomalies(
-            spans=spans,
-            service_stats=service_stats,
-            baselines=baselines,
-            z_threshold=3.0,
-            error_threshold=0.05,
-        )
+        detector = get_detector(mode=detector_mode, span_count=len(spans))
+        alerts, baselines = detector.detect(spans=spans, service_stats=service_stats)
 
-        # 3. Identify primary error service (highest anomaly score)
+        # 3. Optional LLM contextual scoring (adjusts scores, never removes alerts)
+        if use_llm_scorer and alerts:
+            try:
+                from GraphRCA_agent.tools.pipeline.llm_scorer import contextual_score_alerts
+                graph = state.get("graph")
+                pagerank = state.get("pagerank", {})
+                alerts = contextual_score_alerts(alerts, graph=graph, pagerank=pagerank)
+                logger.info(f"[Detection] LLM scorer applied to {len(alerts)} alerts")
+            except Exception as llm_err:
+                logger.warning(f"[Detection] LLM scorer failed (skipping): {llm_err}")
+
+        # 4. Identify primary error service (highest anomaly score)
         if alerts:
             primary = max(alerts, key=lambda a: a.score)
             primary_error_service = primary.service
@@ -66,7 +79,7 @@ def detection_node(state: PipelineState) -> Dict[str, Any]:
             else:
                 primary_error_service = "unknown"
 
-        # 4. Compute pre-mitigation health score μ(s)
+        # 5. Compute pre-mitigation health score μ(s)
         from GraphRCA_agent.tools.safety_tools import compute_health_score
         sla_violations = state.get("sla_violations", [])
         unhealthy_nodes = state.get("unhealthy_nodes", [])
@@ -76,7 +89,8 @@ def detection_node(state: PipelineState) -> Dict[str, Any]:
 
         logger.info(
             f"[Detection] Done in {elapsed}s — "
-            f"{len(alerts)} alerts, primary={primary_error_service}"
+            f"{len(alerts)} alerts, primary={primary_error_service}, "
+            f"detector={detector_mode}"
         )
 
         alert_summary = []

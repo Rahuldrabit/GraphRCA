@@ -73,6 +73,18 @@ class PipelineState(TypedDict, total=False):
     # ── Memory Store ──────────────────────────────────────────────────
     memory_stored: bool
 
+    # ── Infrastructure Topology (Phase 2) ─────────────────────────────
+    infra_topology: dict            # {pods, nodes, pod_to_node, ...}
+    noisy_neighbors: list           # [{pod_a, pod_b, shared_node, evidence}]
+    infra_layer_enabled: bool
+
+    # ── Multi-Agent MCP (Phase 3) ─────────────────────────────────────
+    investigation_strategy: dict    # Triage agent output
+    worker_results: list            # MCP worker results
+    live_evidence: dict             # Synthesis agent findings
+    agent_mode: str                 # "pipeline" | "multi_agent"
+    _worker_task: dict              # Internal: injected by planner via Send()
+
     # ── Pipeline Orchestration ────────────────────────────────────────
     status: str                     # running | complete | rollback | failed
     error: str

@@ -85,19 +85,36 @@ def backward_bfs_traversal(
     G: nx.DiGraph,
     start_service: str,
     max_depth: int = 5,
+    edge_types: Optional[set] = None,
+    infra_max_depth: int = 2,
 ) -> List[List[str]]:
-    """Backward BFS on a directed service graph (predecessor traversal)."""
+    """Backward BFS on a directed service graph (predecessor traversal).
+
+    Args:
+        G:              NetworkX DiGraph (may include infra layer)
+        start_service:  Service node to start BFS from
+        max_depth:      Max hops for CALLS edges (default 5)
+        edge_types:     If None, traverse all edges (backward compatible).
+                        Pass a set like {"CALLS", "COLOCATED"} to filter.
+        infra_max_depth: Max depth for non-CALLS infra edges (default 2).
+
+    Returns:
+        List of paths from start_service backward to root candidates.
+    """
     if not G or not start_service or start_service not in G:
         return []
 
     paths: List[List[str]] = []
-    queue: deque[tuple[str, List[str], int]] = deque([(start_service, [start_service], 0)])
+    # queue: (current_node, path_so_far, call_depth, infra_depth)
+    queue: deque[tuple[str, List[str], int, int]] = deque(
+        [(start_service, [start_service], 0, 0)]
+    )
     max_paths = 200
 
     while queue and len(paths) < max_paths:
-        current, path, depth = queue.popleft()
+        current, path, call_depth, infra_depth = queue.popleft()
 
-        if depth >= max_depth:
+        if call_depth >= max_depth and infra_depth >= infra_max_depth:
             if len(path) > 1:
                 paths.append(path)
             continue
@@ -110,8 +127,34 @@ def backward_bfs_traversal(
                 paths.append(path)
             continue
 
+        has_successor = False
         for p in preds:
-            queue.append((p, path + [p], depth + 1))
+            # Determine edge type for predecessor→current edge
+            edata = G.edges.get((p, current), {}) if G.has_edge(p, current) else {}
+            etype = edata.get("edge_type", "CALLS")
+
+            # Filter by edge_types if specified
+            if edge_types is not None and etype not in edge_types:
+                continue
+
+            # Respect depth limits per edge type
+            if etype == "CALLS":
+                if call_depth >= max_depth:
+                    continue
+                new_call_depth = call_depth + 1
+                new_infra_depth = infra_depth
+            else:
+                # Infra edge (COLOCATED, RUNS_ON, DEPLOYED_AS)
+                if infra_depth >= infra_max_depth:
+                    continue
+                new_call_depth = call_depth
+                new_infra_depth = infra_depth + 1
+
+            queue.append((p, path + [p], new_call_depth, new_infra_depth))
+            has_successor = True
+
+        if not has_successor and len(path) > 1:
+            paths.append(path)
 
     logger.info(f"BFS from {start_service}: found {len(paths)} paths")
     return paths
@@ -140,6 +183,34 @@ def _max_span_count(G: nx.DiGraph) -> int:
         return 1
 
 
+def _adaptive_weights(alerts: List[Any]) -> Dict[str, float]:
+    """Select confidence scoring weights based on the dominant anomaly pattern.
+
+    Error-dominant fault (e.g., misconfig, auth failure):
+        Weight error signals heavily.
+    Latency-dominant fault (e.g., resource exhaustion, slow DB):
+        Weight latency signals heavily.
+    Mixed / unknown:
+        Balanced original weights.
+    """
+    anomaly_types = []
+    for a in alerts:
+        at = getattr(a, "anomaly_type", "") or ""
+        if isinstance(at, str):
+            anomaly_types.append(at.lower())
+
+    has_errors = any("error" in t for t in anomaly_types)
+    has_latency = any("latency" in t for t in anomaly_types)
+
+    if has_errors and not has_latency:
+        return {"error": 0.50, "latency": 0.15, "alerts": 0.20, "volume": 0.10, "depth_boost_max": 0.15}
+    elif has_latency and not has_errors:
+        return {"error": 0.15, "latency": 0.50, "alerts": 0.20, "volume": 0.10, "depth_boost_max": 0.15}
+    else:
+        # Mixed or unknown — original balanced weights
+        return {"error": 0.35, "latency": 0.35, "alerts": 0.15, "volume": 0.10, "depth_boost_max": 0.15}
+
+
 def score_candidate(
     service: str,
     G: nx.DiGraph,
@@ -147,6 +218,7 @@ def score_candidate(
     alerts: List[Any],
     baselines: Dict[str, Any],
     traversal_depth: int = 0,
+    weights: Optional[Dict[str, float]] = None,
 ) -> RCACandidate:
     """Compute confidence that `service` is the root cause."""
     node_attrs: Dict[str, Any] = dict(G.nodes[service]) if (G and service in G) else {}
@@ -194,15 +266,48 @@ def score_candidate(
     # Components
     error_component = min(1.0, error_rate * 3.0)  # 0.33 error_rate -> 1.0
     latency_component = min(1.0, abs(latency_z) / 10.0) if abs(latency_z) > 2.0 else 0.0
-    depth_boost = min(0.15, max(0.0, traversal_depth) * 0.03)
 
-    confidence = (
-        0.35 * error_component
-        + 0.35 * latency_component
-        + 0.15 * alert_score
-        + 0.10 * volume_score
-        + depth_boost
-    )
+    # Infrastructure signal (Phase 2): check if a COLOCATED neighbor is also alerted
+    infra_score = 0.0
+    if G and service in G:
+        alerted_service_names = set()
+        for a in alerts:
+            s = getattr(a, "service", None) or (a.get("service") if isinstance(a, dict) else None)
+            if s:
+                alerted_service_names.add(s)
+        for neighbor in G.neighbors(service):
+            edata = G.edges.get((service, neighbor), {})
+            if edata.get("edge_type") == "COLOCATED" and neighbor in alerted_service_names:
+                infra_score = 0.3
+                break
+
+    # Use caller-supplied weights or derive adaptively from alert pattern
+    if weights is None:
+        weights = _adaptive_weights(alerts)
+    depth_boost_max = weights.get("depth_boost_max", 0.15)
+    depth_boost = min(depth_boost_max, max(0.0, traversal_depth) * 0.03)
+
+    # Renormalize weights when infra signal is present to include infra_score
+    if infra_score > 0:
+        # Scale down other weights by 10% to make room for infra_score (0.10 weight)
+        infra_weight = 0.10
+        scale = 1.0 - infra_weight
+        confidence = (
+            weights["error"] * error_component * scale
+            + weights["latency"] * latency_component * scale
+            + weights["alerts"] * alert_score * scale
+            + weights["volume"] * volume_score * scale
+            + depth_boost
+            + infra_weight * infra_score
+        )
+    else:
+        confidence = (
+            weights["error"] * error_component
+            + weights["latency"] * latency_component
+            + weights["alerts"] * alert_score
+            + weights["volume"] * volume_score
+            + depth_boost
+        )
     confidence = float(max(0.0, min(1.0, round(confidence, 4))))
 
     evidence: List[str] = []
@@ -229,6 +334,7 @@ def score_candidate(
         "alerts": round(alert_score, 4),
         "volume": round(volume_score, 4),
         "depth_boost": round(depth_boost, 4),
+        "infra": round(infra_score, 4),
     }
 
     return RCACandidate(
