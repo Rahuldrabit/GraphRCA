@@ -20,6 +20,17 @@ trace_ingest → graph_builder → detection → memory_search
 | 2 — Causal | Advanced causal inference & temporal ordering | `causal_ranker` |
 | 3 — Observability | eBPF + log pattern deep-dive | `log_pattern` |
 | 4 — Benchmark | AIOpsLab integration (detection / localization / analysis / mitigation) | `agent_aiopslab` |
+> [!NOTE] **v5.1/v5.2** – Added a read‑only `/v1/session/{id}/variables/raw` endpoint for deterministic routing, introduced Guard & Archivist agents, and separated the SLM markdown path from the deterministic path.
+---
+## New Scratchpad Endpoint & Agent Design
+
+- **Read‑only `/v1/session/{id}/variables/raw` endpoint** returns unresolved variables as JSON, enabling deterministic components to fetch state without markdown parsing.
+- **`agents/guard.py`** implements the two‑layer safety gate (block‑list + LLM consistency check).
+- **`agents/archivist.py`** builds the final submit call using the structured read.
+- **`GraphRCAAgentV5`** routes deterministic checks through the new endpoint and uses Guard before invoking the SLM path.
+- **Design overview**: deterministic path → structured read → Guard → optional LLM sync → action.
+
+---
 
 ---
 
@@ -186,6 +197,20 @@ cd GraphRCA_agent
 
 # Custom output directory
 ./run_graphrca.sh -d ./my_output task_name
+
+### Run with v5 Agent (default)
+
+The `GRAPHRCA_V5_ENABLED` environment variable controls which agent is used.
+
+```bash
+# Use the new v5 ScratchPad-driven agent (default)
+GRAPHRCA_V5_ENABLED=True ./run_graphrca.sh <task>
+
+# Force fallback to the legacy LangGraph agent
+GRAPHRCA_V5_ENABLED=False ./run_graphrca.sh <task>
+```
+
+When `GRAPHRCA_V5_ENABLED` is set to `True` (the default), the system creates a `GraphRCAAgentV5` instance that utilizes the structured `/variables/raw` endpoint, Guard, and Archivist. Setting it to `False` falls back to the original `GraphRCAAgent` implementation.
 
 # Verbose mode
 ./run_graphrca.sh -v misconfig_app_hotel_res-detection-1
