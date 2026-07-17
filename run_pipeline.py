@@ -24,6 +24,11 @@ import sys
 import time
 from datetime import datetime
 
+# Inject ScrathPad into sys.path
+scratchpad_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "ScrathPad"))
+if scratchpad_path not in sys.path:
+    sys.path.insert(0, scratchpad_path)
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -450,20 +455,31 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
     logger.info(f"[AIOpsLab] Instructions:\n{str(instructions)[:300]}")
 
     # Create threaded agent (mirrors StratusAgent_AIOpsLab)
-    from GraphRCA_agent.agent_aiopslab import GraphRCAAgent
-    use_neo4j = os.getenv("NEO4J_ENABLED", "False").lower() == "true"
-
-    agent = GraphRCAAgent(
-        problem_desc=problem_desc,
-        task_type=task_type,
-        output_dir=output_dir,
-        verbose=verbose,
-        use_neo4j=use_neo4j,
-    )
+    use_v5 = os.getenv("GRAPHRCA_V5_ENABLED", "True").lower() == "true"
+    
+    if use_v5:
+        from GraphRCA_agent.agent_aiopslab import GraphRCAAgentV5
+        agent = GraphRCAAgentV5(
+            problem_desc=problem_desc,
+            task_type=task_type,
+            output_dir=output_dir,
+            verbose=verbose,
+            use_neo4j=os.getenv("NEO4J_ENABLED", "False").lower() == "true",
+        )
+    else:
+        from GraphRCA_agent.agent_aiopslab import GraphRCAAgent
+        agent = GraphRCAAgent(
+            problem_desc=problem_desc,
+            task_type=task_type,
+            output_dir=output_dir,
+            verbose=verbose,
+            use_neo4j=os.getenv("NEO4J_ENABLED", "False").lower() == "true",
+        )
 
     # Register and start (same pattern as Stratus)
     orchestrator.register_agent(agent, name=orchestrator.agent_name)
-    agent.run()
+    if not use_v5:
+        agent.run()
 
     benchmark_start = time.time()
     logger.info("[AIOpsLab] Starting orchestrator...")

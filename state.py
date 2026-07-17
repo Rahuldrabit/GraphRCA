@@ -92,3 +92,8 @@ class PipelineState(TypedDict, total=False):
     pipeline_start_time: float
     node_timings: dict              # {node_name: elapsed_seconds}
     messages: list                  # Accumulated log messages
+
+    # ── v5 ScratchPad Pointer State ─────────────────────────────────────
+    session_id: str          # Shared ScratchPad incident session ID
+    active_suspects: list    # Top N node IDs from PageRank/BFS
+    current_phase: str       # "ingest" | "diagnose" | "mitigate"
