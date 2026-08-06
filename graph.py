@@ -23,6 +23,7 @@ from typing import Literal
 from langgraph.graph import StateGraph, END
 
 from GraphRCA_agent.state import PipelineState
+from GraphRCA_agent.swarm_state import AIOpsIncidentState
 from GraphRCA_agent.nodes.trace_ingest import trace_ingest_node
 from GraphRCA_agent.nodes.graph_builder import graph_builder_node
 from GraphRCA_agent.nodes.detection import detection_node
@@ -211,10 +212,58 @@ def build_multi_agent_graph() -> StateGraph:
     return workflow
 
 
+def build_scratchpad_swarm_graph() -> StateGraph:
+    """Construct the ScratchPad 4-Agent Swarm StateGraph.
+
+    Architecture:
+        observer_agent
+            ↓
+        topological_diagnoser
+            ↓
+        rca_analyst
+            ↓
+        guardrail_actuator
+            ↓
+        END
+    """
+    from GraphRCA_agent.nodes.observer_agent import ObserverAgent
+    from GraphRCA_agent.nodes.topological_diagnoser import TopologicalDiagnoser
+    from GraphRCA_agent.nodes.rca_analyst_agent import RCAAnalystAgent
+    from GraphRCA_agent.nodes.guardrail_actuator import GuardrailActuator
+    from GraphRCA_agent.tools.scratchpad_client import ScratchpadClient
+
+    workflow = StateGraph(AIOpsIncidentState)
+    client = ScratchpadClient()
+
+    # Need instances to handle state correctly, but langgraph expects functions.
+    # We can instantiate them here and use their __call__ methods.
+    observer = ObserverAgent(client)
+    diagnoser = TopologicalDiagnoser(client)
+    rca = RCAAnalystAgent(client)
+    guardrail = GuardrailActuator()
+
+    workflow.add_node("observer_agent", observer)
+    workflow.add_node("topological_diagnoser", diagnoser)
+    workflow.add_node("rca_analyst", rca)
+    workflow.add_node("guardrail_actuator", guardrail)
+
+    workflow.set_entry_point("observer_agent")
+    workflow.add_edge("observer_agent", "topological_diagnoser")
+    workflow.add_edge("topological_diagnoser", "rca_analyst")
+    workflow.add_edge("rca_analyst", "guardrail_actuator")
+    
+    # Normally there would be a retry loop if guardrail fails, but for simplicity
+    # we just exit.
+    workflow.add_edge("guardrail_actuator", END)
+
+    return workflow
+
+
 # ── Compiled singletons ──────────────────────────────────────────────────────
 
 _compiled_pipeline: object = None
 _compiled_multi_agent: object = None
+_compiled_scratchpad_swarm: object = None
 
 
 def get_graph():
@@ -223,10 +272,18 @@ def get_graph():
     Mode is controlled by GRAPHRCA_AGENT_MODE env var:
       "pipeline"    (default) — existing deterministic 11-node pipeline
       "multi_agent" — hierarchical multi-agent graph with MCP workers
+      "scratchpad_swarm" — 4-agent swarm backed by ScratchPad
     """
-    global _compiled_pipeline, _compiled_multi_agent
+    global _compiled_pipeline, _compiled_multi_agent, _compiled_scratchpad_swarm
 
     mode = os.getenv("GRAPHRCA_AGENT_MODE", "pipeline").lower().strip()
+
+    if mode == "scratchpad_swarm":
+        if _compiled_scratchpad_swarm is None:
+            logger.info("Compiling GraphRCA ScratchPad Swarm StateGraph...")
+            _compiled_scratchpad_swarm = build_scratchpad_swarm_graph().compile()
+            logger.info("GraphRCA ScratchPad Swarm StateGraph compiled successfully")
+        return _compiled_scratchpad_swarm
 
     if mode == "multi_agent":
         if _compiled_multi_agent is None:

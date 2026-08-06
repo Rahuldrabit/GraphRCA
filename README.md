@@ -21,6 +21,92 @@ trace_ingest → graph_builder → detection → memory_search
 | 3 — Observability | eBPF + log pattern deep-dive | `log_pattern` |
 | 4 — Benchmark | AIOpsLab integration (detection / localization / analysis / mitigation) | `agent_aiopslab` |
 
+### ScratchPad 4-Agent Swarm (New)
+
+The pipeline has been redesigned into a **4-agent swarm** architecture backed by the [ScratchPad](../ScratchPad/) middleware, optimized for Small Language Models (≤20B params) and zero conversational history overhead.
+
+#### Architecture Diagram
+
+```mermaid
+graph TD
+    A["AIOpsLab Orchestrator"] -->|"problem_desc + instructions"| INIT["agent_aiopslab.py (Bootstrap)"]
+    INIT -->|"init session"| SP["ScratchPad SQLite WAL<br/>(In-Process)"]
+    INIT -->|"invoke swarm graph"| G["LangGraph StateGraph"]
+    
+    subgraph "4-Agent Swarm Pipeline"
+        G --> OBS["1. Observer Agent<br/>(Non-LLM Rule Engine)"]
+        
+        OBS -->|"get_traces()"| A
+        OBS -->|"get_logs()"| A  
+        OBS -->|"exec_shell(kubectl)"| A
+        A -->|"CSV / JSON / raw text"| OBS
+        
+        OBS -->|"L1 structural triplets<br/>with citation_quote"| SP
+        
+        SP -->|"active SQLite edges"| TOPO["2. Topological Diagnoser<br/>(NetworkX PPR, Zero-Token)"]
+        TOPO -->|"top-3 suspect nodes"| STATE["Swarm State"]
+        
+        STATE --> RCA["3. RCA Analyst Agent<br/>(SLM, ≤500 token context)"]
+        SP -->|"≤500 token Markdown view"| RCA
+        RCA -->|"verified hypothesis<br/>(citation_quote match)"| SP
+        
+        RCA --> ACT["4. Guardrail Actuator<br/>(SLM + Safety Regex)"]
+        SP -->|"shared memory read"| ACT
+        ACT -->|"exec_shell(kubectl fix)"| A
+    end
+    
+    ACT -->|"submit(result)"| A
+    
+    SWEEP["Louvain Sweeper<br/>(On-Demand)"] -.->|"L2 compression"| SP
+    
+    subgraph "Logging & Reporting"
+        LOG["Per-Run Timestamped Log<br/>agent_run_YYYYMMDD_HHMMSS.log"]
+        RPT["Batch Report<br/>full_batch_report.md"]
+    end
+```
+
+#### Data Flow Diagram (Per Task Execution)
+
+```mermaid
+sequenceDiagram
+    participant O as AIOpsLab Orchestrator
+    participant A as agent_aiopslab.py
+    participant OBS as Observer (Non-LLM)
+    participant SP as ScratchPad SQLite
+    participant TOPO as Diagnoser (NetworkX)
+    participant RCA as RCA Analyst (SLM)
+    participant ACT as Actuator (SLM+Rules)
+
+    O->>A: problem_desc + instructions + APIs
+    A->>SP: init_session(problem_id, goal)
+    A->>OBS: invoke observer_node(state)
+    
+    OBS->>O: get_traces("namespace", 5)
+    O-->>OBS: CSV/DataFrame traces
+    OBS->>SP: commit L1 triplets (calls, emits, connects_to)
+    
+    OBS->>O: exec_shell("kubectl get pods")
+    O-->>OBS: pod status text
+    OBS->>SP: commit L1 triplets (emits CrashLoopBackOff)
+    
+    Note over OBS,SP: All raw text → ScratchPad<br/>Only ≤500 token view exits
+    
+    SP->>TOPO: read active edges
+    TOPO->>TOPO: build DiGraph, reverse calls, compute PPR
+    TOPO-->>A: suspect_nodes = ["payment-db", "cart-svc", "auth"]
+    
+    SP->>RCA: compile_bounded_markdown_view(max_tokens=500)
+    RCA->>RCA: llm_reason(suspects + markdown_context)
+    RCA->>SP: commit_verified_hypothesis(citation_quote match)
+    
+    RCA-->>ACT: confirmed_root_cause
+    ACT->>ACT: safety regex check
+    ACT->>O: exec_shell("kubectl rollout restart deployment/geo")
+    O-->>ACT: stdout result
+    
+    ACT->>O: submit("Yes") / submit(["geo"]) / submit({...}) / submit()
+```
+
 ---
 
 ## Methodology (How GraphRCA solves SRE tasks)
