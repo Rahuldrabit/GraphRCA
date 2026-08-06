@@ -28,15 +28,24 @@ class SwarmGraphRCAAgent(GraphRCAAgent):
         
         logger.info(f"Starting SwarmGraphRCAAgent for namespace: {self.namespace}")
         
-        # Set up state
+        trace_csv = os.path.join(trace_dir, "aiopslab_traces.csv")
+        kubectl_out = self._run_kubectl(f"kubectl get pods -n {self.namespace}")
+        
+        # Set up state with raw telemetry
         state = AIOpsIncidentState(
-            scratchpad_session_id=f"session_{self.namespace}_{timestamp}",
+            problem_id=f"incident_{self.namespace}",
             task_type=self.task_type,
-            problem_description=self.problem_desc,
-            trace_csv_path=os.path.join(trace_dir, "aiopslab_traces.csv"),
+            scratchpad_session_id=f"session_{self.namespace}_{timestamp}",
+            namespace=self.namespace,
+            raw_telemetry={
+                "trace_csv_path": trace_csv,
+                "kubectl": kubectl_out,
+            },
             suspect_nodes=[],
             verified_root_cause=None,
-            final_submission=None
+            final_submission=None,
+            retry_count=0,
+            error=None
         )
         
         # Execute swarm graph

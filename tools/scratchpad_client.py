@@ -91,9 +91,13 @@ class ScratchpadClient:
 
     def run_sweeper(self, session_id: str) -> None:
         """Triggers the on-demand Louvain L2 sweeper."""
-        # Optional: Since the sweeper is a background process normally, 
-        # we can import and run it directly here or omit it if it's too complex.
-        pass
+        try:
+            from sweeper import GraphSweeperDaemon
+            sweeper = GraphSweeperDaemon()
+            sweeper.execute_maintenance_sweep()
+            print(f"[ScratchPad] Maintenance sweep executed for session {session_id}")
+        except Exception as e:
+            print(f"[ScratchPad] Sweeper execution error: {e}")
         
     def drill_down(self, session_id: str, node: str) -> str:
         """Gets detailed context for a specific node (L2 expansion)."""

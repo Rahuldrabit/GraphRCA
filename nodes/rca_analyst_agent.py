@@ -5,15 +5,19 @@ from swarm_state import AIOpsIncidentState
 from tools.scratchpad_client import ScratchpadClient
 from llm import llm_reason
 
+from tools.scratchpad_interceptor import ScratchpadToolInterceptor
+
 logger = logging.getLogger(__name__)
 
 class RCAAnalystAgent:
     """
     SLM agent that analyzes the ScratchPad markdown view.
     Verifies the root cause and provides a citation quote.
+    Supports tool calling via ScratchpadToolInterceptor for L2 drill-downs and hypothesis commitments.
     """
     def __init__(self, scratchpad_client: ScratchpadClient):
         self.client = scratchpad_client
+        self.interceptor = ScratchpadToolInterceptor(scratchpad_client)
 
     def __call__(self, state: AIOpsIncidentState) -> AIOpsIncidentState:
         session_id = state["scratchpad_session_id"]
@@ -56,18 +60,29 @@ class RCAAnalystAgent:
         )
         
         try:
-            # Simple JSON extraction
             start = response.find("{")
             end = response.rfind("}") + 1
             if start != -1 and end != -1:
                 json_str = response[start:end]
                 data = json.loads(json_str)
                 
+                # Check for tool call request
+                if "tool_name" in data and data["tool_name"] == "drill_down_l2_summary":
+                    node_id = data.get("node_id", suspects[0])
+                    logger.info(f"RCA Analyst requested L2 drill-down for node: {node_id}")
+                    drill_summary = self.client.drill_down(session_id, node_id)
+                    user_prompt += f"\n\nL2 Drill Down Summary for {node_id}:\n{drill_summary}"
+                    response = llm_reason(prompt=user_prompt, system_prompt=system_prompt, max_tokens=300, caller="rca_analyst")
+                    start = response.find("{")
+                    end = response.rfind("}") + 1
+                    if start != -1 and end != -1:
+                        data = json.loads(response[start:end])
+
                 root_cause = data.get("root_cause_service")
                 if root_cause:
                     state["verified_root_cause"] = root_cause
                     
-                    # Commit the verified hypothesis back to ScratchPad
+                    # Commit the verified hypothesis back to ScratchPad via interceptor logic
                     self.client.commit_triplets(
                         session_id, 
                         "RCAAnalyst", 

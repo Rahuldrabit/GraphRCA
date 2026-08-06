@@ -1,3 +1,4 @@
+import os
 import re
 import csv
 import json
@@ -6,15 +7,47 @@ from typing import List, Dict, Any
 from swarm_state import AIOpsIncidentState
 from tools.scratchpad_client import ScratchpadClient
 
+try:
+    from rapidfuzz import process, fuzz
+except ImportError:
+    process = None
+    fuzz = None
+
 logger = logging.getLogger(__name__)
 
 class ObserverAgent:
     """
     Non-LLM rule engine.
     Parses AIOpsLab telemetry (traces, metrics, logs, kubectl) and outputs L1 triplets.
+    Uses RapidFuzz for entity canonicalization.
     """
     def __init__(self, scratchpad_client: ScratchpadClient):
         self.client = scratchpad_client
+
+    def canonicalize_entity(self, raw_name: str, candidate_pool: List[str] = None) -> str:
+        """
+        Canonicalizes raw pod/service strings using RapidFuzz if candidates provided,
+        otherwise applies standard normalization.
+        """
+        if not raw_name:
+            return "UNKNOWN"
+            
+        clean_name = raw_name.strip()
+        if candidate_pool and process and fuzz:
+            match = process.extractOne(clean_name, candidate_pool, scorer=fuzz.WRatio)
+            if match and match[1] >= 75:
+                return match[0].upper().replace("-", "_")
+                
+        # Heuristic fallback: strip K8s random hashes (e.g. frontend-6b4594c9-x2z9p -> FRONTEND)
+        if "-" in clean_name:
+            parts = clean_name.split("-")
+            # If suffix looks like pod hash
+            if len(parts) >= 3 and len(parts[-1]) >= 4:
+                clean_name = "-".join(parts[:-2])
+            elif len(parts) >= 2 and len(parts[-1]) >= 4:
+                clean_name = "-".join(parts[:-1])
+                
+        return clean_name.upper().replace("-", "_")
 
     def parse_traces(self, trace_csv_path_or_text: str) -> List[Dict[str, Any]]:
         """
@@ -28,29 +61,35 @@ class ObserverAgent:
         if not trace_csv_path_or_text:
             return triplets
             
-        # Basic heuristic parsing for CSV lines
-        lines = trace_csv_path_or_text.strip().split('\n')
+        content = trace_csv_path_or_text
+        if os.path.exists(trace_csv_path_or_text):
+            try:
+                with open(trace_csv_path_or_text, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                logger.error(f"Failed to read trace file {trace_csv_path_or_text}: {e}")
+                return triplets
+                
+        lines = content.strip().split('\n')
         if len(lines) < 2:
             return triplets
             
-        # Map of span_id to service_name
         span_to_svc = {}
-        # We need to parse headers or just use a generic regex if it's text
         try:
             reader = csv.DictReader(lines)
             rows = list(reader)
             
             for row in rows:
                 span_id = row.get("span_id", "")
-                svc = row.get("service_name", "").upper().replace("-", "_")
+                svc = self.canonicalize_entity(row.get("service_name", ""))
                 span_to_svc[span_id] = svc
                 
             for row in rows:
                 span_id = row.get("span_id", "")
                 parent_id = row.get("parent_span", "")
-                svc = row.get("service_name", "").upper().replace("-", "_")
-                has_error = row.get("has_error", "false").lower() == "true"
-                response = row.get("response", "")
+                svc = self.canonicalize_entity(row.get("service_name", ""))
+                has_error = str(row.get("has_error", "false")).lower() == "true"
+                response = str(row.get("response", ""))
                 
                 # Rule 1: calls
                 if parent_id and parent_id in span_to_svc:
@@ -86,9 +125,9 @@ class ObserverAgent:
                 metric = result.get("metric", {})
                 pod = metric.get("pod", "")
                 if pod:
-                    svc = "-".join(pod.split("-")[:-2]).upper().replace("-", "_") if "-" in pod else pod.upper()
+                    svc = self.canonicalize_entity(pod)
                     status = metric.get("status", "")
-                    if status and status.startswith("5"):
+                    if status and str(status).startswith("5"):
                         triplets.append({
                             "source": svc,
                             "relationship": "emits",
@@ -99,10 +138,10 @@ class ObserverAgent:
             pass
         return triplets
 
-    def parse_logs(self, log_text: str, service: str) -> List[Dict[str, Any]]:
-        """Parses raw logs using regex."""
+    def parse_logs(self, log_text: str, service: str = "") -> List[Dict[str, Any]]:
+        """Parses raw logs using regex and canonicalization."""
         triplets = []
-        svc = service.upper().replace("-", "_")
+        svc = self.canonicalize_entity(service) if service else "UNKNOWN_SERVICE"
         for line in log_text.split('\n'):
             if "ERROR" in line.upper() or "FATAL" in line.upper():
                 triplets.append({
@@ -129,7 +168,7 @@ class ObserverAgent:
             if len(parts) >= 3:
                 pod = parts[0]
                 status = parts[2]
-                svc = "-".join(pod.split("-")[:-2]).upper().replace("-", "_") if "-" in pod else pod.upper()
+                svc = self.canonicalize_entity(pod)
                 
                 if status not in ["Running", "Completed"]:
                     triplets.append({
@@ -142,14 +181,35 @@ class ObserverAgent:
         
     def __call__(self, state: AIOpsIncidentState) -> AIOpsIncidentState:
         """
-        In a real run, this node would execute API calls to AIOpsLab,
-        get telemetry, and parse it. Since we intercept telemetry dynamically,
-        this acts as a parsing orchestrator if needed.
+        Dynamically parses raw telemetry passed in state and populates ScratchPad with L1 triplets.
         """
-        # Commit a starting triplet
-        self.client.commit_triplets(
-            state["scratchpad_session_id"], 
-            "ObserverAgent", 
-            [{"source": "SYSTEM", "relationship": "has_task", "target": state["task_type"], "citation_quote": "AIOpsLab task started"}]
-        )
+        session_id = state["scratchpad_session_id"]
+        all_triplets = [
+            {"source": "SYSTEM", "relationship": "has_task", "target": state["task_type"], "citation_quote": "AIOpsLab task started"}
+        ]
+        
+        raw_telemetry = state.get("raw_telemetry") or {}
+        trace_path = state.get("trace_csv_path") or raw_telemetry.get("trace_csv_path")
+        
+        # 1. Traces
+        if trace_path:
+            all_triplets.extend(self.parse_traces(trace_path))
+            
+        # 2. Logs
+        logs = raw_telemetry.get("logs")
+        if logs:
+            all_triplets.extend(self.parse_logs(logs, service=state.get("namespace", "")))
+            
+        # 3. Kubectl
+        kubectl_out = raw_telemetry.get("kubectl")
+        if kubectl_out:
+            all_triplets.extend(self.parse_kubectl(kubectl_out))
+            
+        # 4. Metrics
+        metrics_json = raw_telemetry.get("metrics")
+        if metrics_json:
+            all_triplets.extend(self.parse_metrics(metrics_json))
+            
+        self.client.commit_triplets(session_id, "ObserverAgent", all_triplets)
+        logger.info(f"[ObserverAgent] Parsed and committed {len(all_triplets)} L1 triplets to session {session_id}")
         return state

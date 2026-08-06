@@ -18,6 +18,10 @@ class AIOpsIncidentState(TypedDict):
     # Task specific submission parameters
     final_submission: Optional[Any]   # Format depends on task_type
     
+    # Telemetry Data Pointers
+    namespace: Optional[str]
+    raw_telemetry: Optional[Dict[str, Any]]
+    
     # Internal routing
     retry_count: int
     error: Optional[str]
