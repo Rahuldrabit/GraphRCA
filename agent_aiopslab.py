@@ -1160,3 +1160,104 @@ class GraphRCAAgent:
         except Exception as e:
             logger.error(f"[Agent] Default submit failed: {e}")
         self.stop_event.set()
+
+class GraphRCAAgentV5:
+    """GraphRCA v5 Agent — Protocol-Accurate AIOpsLab integration.
+    
+    Uses ScratchPad as the primary execution engine. get_action() evaluates
+    what is unresolved and asks for environment data only when necessary.
+    """
+
+    def __init__(
+        self,
+        problem_desc: str,
+        task_type: str,
+        output_dir: str,
+        verbose: bool = False,
+        use_neo4j: bool = False,
+    ):
+        import uuid
+        import re
+        import asyncio
+        from planner.context import AgentContext
+        from graphrca.scratchpad_io import T_init_session, T_seed_variables
+
+        self.problem_desc = problem_desc
+        self.task_type = task_type
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.result = {}
+        self._run_count = 0
+        
+        # Extract namespace
+        self.namespace = "default"
+        patterns = [
+            r"namespace[:\s]+['\"]?(\S+)['\"]?",
+            r"hotel[_-]res\w*",
+            r"astronomy[_-]shop\w*",
+            r"social[_-]network\w*",
+        ]
+        for pat in patterns:
+            m = re.search(pat, problem_desc, re.IGNORECASE)
+            if m:
+                self.namespace = (m.group(1) if m.lastindex else m.group(0)).replace("_", "-")
+                break
+
+        # Generate unique session ID for this run
+        self.session_id = f"inc_{uuid.uuid4().hex[:8]}"
+        
+        # Init ScratchPad session
+        logger.info(f"[GraphRCAAgentV5] Initializing session {self.session_id}")
+        asyncio.run(T_init_session(self.session_id, f"Resolve {task_type} in {self.namespace}"))
+        
+        self.ctx = AgentContext(self.session_id, task_type, self.namespace)
+        
+        # Seed variables
+        from planner.context import TASK_REQUIRED_VARS
+        req_vars = TASK_REQUIRED_VARS.get(task_type, [])
+        if req_vars:
+            asyncio.run(T_seed_variables(self.ctx.shared_client, req_vars))
+            
+        self.max_internal_iters = 8
+
+    async def get_action(self, observation: str) -> str:
+        """Called by AIOpsLab orchestrator with environment responses.
+        
+        Returns exactly one fenced code block containing the next action.
+        """
+        from planner.router import plan_next_step
+        
+        logger.info(f"[AIOpsLab→AgentV5] {observation[:200]}")
+        
+        if self.ctx.has_pending_observation(observation):
+            self.ctx.commit_environment_response(observation)
+            
+        for _ in range(self.max_internal_iters):
+            next_action = plan_next_step(self.ctx)
+            if next_action is not None:
+                self.ctx.record_pending_action(next_action)
+                cmd = self._format_as_code_block(next_action)
+                logger.info(f"[AgentV5→AIOpsLab] {cmd}")
+                return cmd
+                
+            if self.ctx.all_required_vars_resolved():
+                submit_call = self.ctx.build_submit_call()
+                cmd = self._format_as_code_block(submit_call)
+                logger.info(f"[AgentV5→AIOpsLab] {cmd}")
+                return cmd
+                
+        # Budget exhausted internally without full resolution
+        logger.warning("[AgentV5] Internal iteration budget exhausted, submitting best-effort.")
+        submit_call = self.ctx.build_submit_call(best_effort=True)
+        cmd = self._format_as_code_block(submit_call)
+        logger.info(f"[AgentV5→AIOpsLab] {cmd}")
+        return cmd
+
+    def _format_as_code_block(self, action_str: str) -> str:
+        return f"```\n{action_str}\n```"
+        
+    def finalize(self):
+        """Clean up resources."""
+        import asyncio
+        asyncio.run(self.ctx.close())
+
