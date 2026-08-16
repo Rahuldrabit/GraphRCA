@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import logging
 from typing import Dict, Any, List
 from swarm_state import AIOpsIncidentState
@@ -20,15 +21,107 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(os.getenv(name, str(default))).strip().lower() in ("1", "true", "yes", "on")
 
 
+# Completion-token budget for the RCA / drill-down LLM calls. gemma4-graphrca is a
+# "thinking" model: on the REAL pipeline (richer graph than the offline harness)
+# its reasoning runs well past 4096 tokens, hits the old hardcoded cap mid-trace,
+# and emits an EMPTY response -> `_extract_json` raises "empty response" -> the
+# drill loop aborts -> falls back to `suspects[0]` (the loudest SYMPTOM service,
+# e.g. compose-post-service, not the root cause) -> Localization Accuracy 0.0.
+# 8192 gives ~2x headroom over the observed ~4k reasoning trace + the ~300-token
+# JSON answer, and sits comfortably inside the num_ctx=32768 baked into
+# gemma4-graphrca:12b. Tunable per-run without a code edit.
+RCA_MAX_TOKENS = _env_int("GRAPHRCA_RCA_MAX_TOKENS", 8192)
+
+
+def _balanced_objects(s: str):
+    """Yield each top-level balanced {...} substring in s (string/escape-aware)."""
+    depth = 0
+    in_str = False
+    esc = False
+    start = None
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        yield s[start:i + 1]
+                        start = None
+
+
 def _extract_json(raw: str) -> Dict[str, Any]:
-    """Best-effort JSON object extraction from an LLM response."""
-    if not raw:
+    """Best-effort JSON object extraction from an LLM response.
+
+    Tolerant of what small / reasoning models actually emit:
+      - <think>/<reasoning>/<reflection> blocks (deepseek-r1, gemma CoT) — stripped.
+      - ```json ... ``` code fences — unwrapped.
+      - JSON embedded in prose / with trailing commentary — brace-matched.
+      - Whitespace-only or None — raises "empty response".
+    Returns the first parsed dict.
+    """
+    if raw is None:
         raise ValueError("empty response")
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("no JSON object found")
-    return json.loads(raw[start:end + 1].strip())
+    text = str(raw).strip()
+    if not text:
+        raise ValueError("empty response")
+
+    # 1. Drop reasoning/think blocks (paired first, then any dangling unclosed prefix).
+    text = re.sub(
+        r"<(?:think|reasoning|reflection)>.*?</(?:think|reasoning|reflection)>",
+        "", text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<(?:think|reasoning|reflection)>.*", "", text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    # Gemma4 "thinking" artifacts: the <|think|> enable token and the
+    # <|channel|>thought … <|/channel|> reasoning wrapper (empty when thinking is
+    # off). Strip paired blocks + the enable token; the brace-matcher below is the
+    # real backstop if any control tokens leak through past ollama's own stripping.
+    text = re.sub(r"<\|channel\|>\s*thought.*?<\|/channel\|>", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<\|/?think\|>", " ", text)
+    text = text.strip()
+    if not text:
+        raise ValueError("empty response (only reasoning)")
+
+    # 2. Unwrap a code fence if present.
+    candidates: List[str] = []
+    fence = re.search(r"```[a-zA-Z0-9]*\s*(.*?)```", text, flags=re.DOTALL)
+    if fence:
+        candidates.append(fence.group(1).strip())
+    candidates.append(text)
+
+    # 3. Try direct parse, then each balanced object, of each candidate.
+    for cand in candidates:
+        cand = cand.strip()
+        if not cand:
+            continue
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        for span in _balanced_objects(cand):
+            try:
+                obj = json.loads(span)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+
+    raise ValueError("no JSON object found")
 
 
 class RCAAnalystAgent:
@@ -107,7 +200,7 @@ class RCAAnalystAgent:
         response = llm_reason(
             prompt=user_prompt,
             system_prompt=system_prompt,
-            max_tokens=300,
+            max_tokens=RCA_MAX_TOKENS,
             caller="rca_analyst"
         )
 
@@ -186,12 +279,27 @@ class RCAAnalystAgent:
                 "Prefer `final` once you are confident. Use exact service names; do not invent names."
             )
 
-            raw = llm_reason(prompt=prompt, system_prompt=system_prompt, max_tokens=300,
+            raw = llm_reason(prompt=prompt, system_prompt=system_prompt, max_tokens=RCA_MAX_TOKENS,
                              caller=f"rca_analyst.drill.r{round_idx}")
-            try:
-                data = _extract_json(raw)
-            except Exception as e:
-                logger.warning(f"[RCA] round {round_idx} parse failed ({e}); ending loop")
+            data = None
+            for _attempt in (1, 2):  # one retry on parse failure before giving up
+                try:
+                    data = _extract_json(raw)
+                    break
+                except Exception as e:
+                    if _attempt == 1:
+                        logger.debug(
+                            f"[RCA] round {round_idx} parse failed ({e}); retrying with stricter instruction")
+                        raw = llm_reason(
+                            prompt=prompt + "\n\nReply with ONLY the JSON object — "
+                            "no prose, no code fence, no reasoning.",
+                            system_prompt=system_prompt, max_tokens=RCA_MAX_TOKENS,
+                            caller=f"rca_analyst.drill.r{round_idx}.retry",
+                        )
+                    else:
+                        logger.warning(
+                            f"[RCA] round {round_idx} parse failed ({e}); ending loop")
+            if data is None:
                 break
 
             action = str(data.get("action", "")).strip().lower()

@@ -1,6 +1,12 @@
 """Neo4j Connector — GraphRCA's own implementation.
 
-Provides connection to Neo4j for knowledge graph storage.
+Connection priority:
+  1. Local Neo4j  (bolt://localhost:7687  — Docker container)
+  2. Remote Aura  (only when NEO4J_AURA_FALLBACK=true and local is unreachable)
+  3. NetworkX     (pure in-memory graph — automatic fallback when both above fail)
+
+Set NEO4J_ENABLED=True  → tries local first, then Aura if configured
+Set NEO4J_ENABLED=False → skips Neo4j entirely, uses NetworkX only
 """
 
 import logging
@@ -12,19 +18,71 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# ── NetworkX in-memory fallback store ────────────────────────────────────────
+
+class NetworkXKGStore:
+    """Lightweight NetworkX-based knowledge graph used when Neo4j is unavailable.
+
+    Exposes the same interface as Neo4jConnector so the rest of the pipeline
+    never needs to handle a None connector:
+        is_available(), run_query(), execute_write(), execute_read(), clear_database()
+    Cypher queries are silently ignored — the pipeline builds its own in-memory
+    NetworkX DAG via graph_tools anyway; this store just prevents None errors.
+    """
+
+    def __init__(self):
+        try:
+            import networkx as nx
+            self._G = nx.DiGraph()
+            self._available = True
+            logger.info("[KG] Using NetworkX in-memory knowledge graph (Neo4j not available)")
+        except ImportError:
+            self._available = False
+            logger.warning("[KG] NetworkX not installed — knowledge graph store disabled")
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def run_query(self, query: str, parameters: dict = None):
+        """Cypher queries are no-ops in NetworkX mode."""
+        return []
+
+    def execute_write(self, query: str, parameters: dict = None):
+        return self.run_query(query, parameters)
+
+    def execute_read(self, query: str, parameters: dict = None):
+        return self.run_query(query, parameters)
+
+    def clear_database(self):
+        if self._available:
+            import networkx as nx
+            self._G = nx.DiGraph()
+
+    def get_graph(self):
+        """Return the underlying NetworkX DiGraph."""
+        return self._G
+
+
+# ── Neo4j connector ───────────────────────────────────────────────────────────
+
 class Neo4jConnector:
-    """Neo4j connection wrapper with lazy initialization."""
-    
+    """Neo4j connection wrapper with lazy init, local-first, and Aura fallback."""
+
     def __init__(self, uri: str = None, user: str = None, password: str = None):
-        self.uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        # Support both NEO4J_USERNAME (used elsewhere) and NEO4J_USER
-        self.user = user or os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER", "neo4j")
-        self.password = password or os.getenv("NEO4J_PASSWORD", "password")
-        self._driver = None
-        self._available = None
+        self.uri      = uri      or os.getenv("NEO4J_URI",      "bolt://localhost:7687")
+        self.user     = user     or os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER", "neo4j")
+        self.password = password or os.getenv("NEO4J_PASSWORD")
+        if not self.password:
+            raise ValueError(
+                "Neo4j password not set. Pass password= explicitly or set the "
+                "NEO4J_PASSWORD environment variable."
+            )
+        self._driver: Optional[object] = None
+        self._available: Optional[bool] = None
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _classify_query(self, query: str) -> str:
-        """Classify query roughly as read/write/delete for logging."""
         q = re.sub(r"\s+", " ", (query or "").strip()).upper()
         if not q:
             return "unknown"
@@ -33,59 +91,73 @@ class Neo4jConnector:
         if re.search(r"\b(CREATE|MERGE|SET|REMOVE|DROP)\b", q):
             return "write"
         return "read"
-    
-    def _connect(self):
-        """Lazily connect to Neo4j."""
-        if self._driver is not None:
-            return
+
+    def _try_connect(self, uri: str, user: str, password: str) -> bool:
+        """Try to connect to a specific URI. Returns True on success."""
         try:
             from neo4j import GraphDatabase
-            self._driver = GraphDatabase.driver(
-                self.uri,
-                auth=(self.user, self.password)
-            )
-            # Test connection
-            with self._driver.session() as session:
-                session.run("RETURN 1")
+            drv = GraphDatabase.driver(uri, auth=(user, password))
+            with drv.session() as s:
+                s.run("RETURN 1")
+            self._driver    = drv
             self._available = True
-            logger.info(f"Connected to Neo4j at {self.uri}")
+            self.uri        = uri
+            logger.info(f"[Neo4j] Connected at {uri}")
+            return True
         except Exception as e:
-            logger.warning(f"Could not connect to Neo4j: {e}")
-            self._available = False
-            self._driver = None
-    
+            logger.warning(f"[Neo4j] {uri!r} unreachable: {e}")
+            return False
+
+    def _connect(self):
+        """Lazily connect — local first, then Aura fallback."""
+        if self._driver is not None:
+            return
+
+        # 1. Primary URI (local Docker by default)
+        if self._try_connect(self.uri, self.user, self.password):
+            return
+
+        # 2. Remote Aura fallback
+        if os.getenv("NEO4J_AURA_FALLBACK", "false").lower() == "true":
+            aura_uri  = os.getenv("NEO4J_AURA_URI", "")
+            aura_pass = os.getenv("NEO4J_AURA_PASSWORD", "")
+            aura_user = os.getenv("NEO4J_USERNAME", "neo4j")
+            if aura_uri and aura_pass:
+                if self._try_connect(aura_uri, aura_user, aura_pass):
+                    return
+
+        self._available = False
+        self._driver    = None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def is_available(self) -> bool:
-        """Check if Neo4j connection is available."""
         if self._available is None:
             self._connect()
-        return self._available
-    
+        return bool(self._available)
+
     def get_driver(self):
-        """Get the Neo4j driver."""
         if self._driver is None:
             self._connect()
         return self._driver
-    
+
     def close(self):
-        """Close the Neo4j connection."""
         if self._driver:
             self._driver.close()
-            self._driver = None
-            self._available = None
-    
+        self._driver    = None
+        self._available = None
+
     def run_query(self, query: str, parameters: dict = None):
-        """Run a Cypher query."""
+        """Run a Cypher query and return a list of records (or None if unavailable)."""
         if not self.is_available():
-            logger.warning("Neo4j not available, skipping query")
+            logger.warning("[Neo4j] Not available, skipping query")
             return None
 
         params = parameters or {}
-        op = self._classify_query(query)
+        op     = self._classify_query(query)
 
-        # Structured tracing (if enabled)
         try:
             from GraphRCA_agent.trace_logger import trace_event
-
             trace_event("neo4j.query", tool="neo4j", op=op, query=query, parameters=params)
         except Exception:
             pass
@@ -93,102 +165,93 @@ class Neo4jConnector:
         t0 = time.time()
         try:
             with self._driver.session() as session:
-                result = session.run(query, params)
+                result  = session.run(query, params)
                 records = list(result)
                 summary = result.consume()
 
             counters = {}
-            if summary is not None and getattr(summary, "counters", None) is not None:
+            if summary and getattr(summary, "counters", None):
                 c = summary.counters
-                # Expose the counters users care about (ingested/deleted)
                 counters = {
-                    "nodes_created": getattr(c, "nodes_created", 0),
-                    "nodes_deleted": getattr(c, "nodes_deleted", 0),
+                    "nodes_created":         getattr(c, "nodes_created", 0),
+                    "nodes_deleted":         getattr(c, "nodes_deleted", 0),
                     "relationships_created": getattr(c, "relationships_created", 0),
                     "relationships_deleted": getattr(c, "relationships_deleted", 0),
-                    "properties_set": getattr(c, "properties_set", 0),
-                    "labels_added": getattr(c, "labels_added", 0),
-                    "indexes_added": getattr(c, "indexes_added", 0),
-                    "constraints_added": getattr(c, "constraints_added", 0),
+                    "properties_set":        getattr(c, "properties_set", 0),
+                    "labels_added":          getattr(c, "labels_added", 0),
                 }
 
-            elapsed = time.time() - t0
-
+            elapsed = round(time.time() - t0, 3)
             try:
                 from GraphRCA_agent.trace_logger import trace_event
-
-                trace_event(
-                    "neo4j.result",
-                    tool="neo4j",
-                    op=op,
-                    record_count=len(records),
-                    counters=counters,
-                    elapsed_seconds=round(elapsed, 3),
-                )
+                trace_event("neo4j.result", tool="neo4j", op=op,
+                            record_count=len(records), counters=counters,
+                            elapsed_seconds=elapsed)
             except Exception:
                 pass
 
-            logger.debug(f"Neo4j {op} query completed: records={len(records)} counters={counters}")
+            logger.debug(f"[Neo4j] {op} → {len(records)} records  {counters}")
             return records
+
         except Exception as e:
-            elapsed = time.time() - t0
+            elapsed = round(time.time() - t0, 3)
             try:
                 from GraphRCA_agent.trace_logger import trace_event
-
-                trace_event(
-                    "neo4j.error",
-                    tool="neo4j",
-                    op=op,
-                    query=query,
-                    parameters=params,
-                    error=str(e),
-                    elapsed_seconds=round(elapsed, 3),
-                )
+                trace_event("neo4j.error", tool="neo4j", op=op,
+                            query=query, error=str(e), elapsed_seconds=elapsed)
             except Exception:
                 pass
             raise
 
-    # ── Stratus compatibility ─────────────────────────────────────────────
-
+    # Stratus-compatible aliases
     def execute_write(self, query: str, parameters: dict = None):
-        """Stratus-style alias for write queries.
-
-        Some pipeline tools expect a connector with `execute_write(...)`.
-        GraphRCA's native method is `run_query(...)`.
-        """
         return self.run_query(query, parameters)
 
     def execute_read(self, query: str, parameters: dict = None):
-        """Stratus-style alias for read queries."""
         return self.run_query(query, parameters)
-    
+
     def clear_database(self):
-        """Clear all data from Neo4j."""
-        if not self.is_available():
-            return
-        self.run_query("MATCH (n) DETACH DELETE n")
-        logger.info("Cleared all Neo4j data")
+        if self.is_available():
+            self.run_query("MATCH (n) DETACH DELETE n")
+            logger.info("[Neo4j] Database cleared")
 
 
-# Singleton instance
-_connector: Optional[Neo4jConnector] = None
+# ── Singleton with automatic fallback ────────────────────────────────────────
+
+_connector: Optional[object] = None   # Neo4jConnector | NetworkXKGStore
 
 
-def get_neo4j_connector() -> Optional[Neo4jConnector]:
-    """Get the singleton Neo4j connector."""
+def get_neo4j_connector() -> object:
+    """Return the best available KG store (never returns None).
+
+    Decision:
+      NEO4J_ENABLED=False → NetworkXKGStore
+      NEO4J_ENABLED=True  → Neo4jConnector (local bolt → Aura)
+                            → NetworkXKGStore if both fail
+    """
     global _connector
-    if _connector is None:
-        enabled = os.getenv("NEO4J_ENABLED", "False").lower() == "true"
-        if not enabled:
-            logger.info("Neo4j disabled (NEO4J_ENABLED != True)")
-            return None
-        _connector = Neo4jConnector()
+    if _connector is not None:
+        return _connector
+
+    if os.getenv("NEO4J_ENABLED", "False").lower() != "true":
+        logger.info("[KG] NEO4J_ENABLED=False → using NetworkX in-memory store")
+        _connector = NetworkXKGStore()
+        return _connector
+
+    neo = Neo4jConnector()
+    if neo.is_available():
+        logger.info(f"[KG] Neo4j online at {neo.uri}")
+        _connector = neo
+    else:
+        logger.warning("[KG] Neo4j unavailable → falling back to NetworkX in-memory store")
+        _connector = NetworkXKGStore()
+
     return _connector
 
 
 def reset_connector():
-    """Reset the singleton connector (for testing)."""
+    """Reset the singleton — call between task runs or in tests."""
     global _connector
-    if _connector:
+    if isinstance(_connector, Neo4jConnector):
         _connector.close()
     _connector = None
