@@ -1,0 +1,17 @@
+FROM gemma4:12b
+
+# GraphRCA RCA / drill-down configuration.
+#
+# ROOT CAUSE: gemma4 is a "thinking" model — it reasons for ~3,000-4,000 tokens in
+# message.reasoning BEFORE emitting the final JSON answer in message.content. With
+# ollama's DEFAULT num_ctx (~2-4K) the ~2-3K-token drill prompt + the reasoning
+# exceeded the context window, so the answer was never generated -> EMPTY content
+# (the "300 completion tokens / 0 chars" symptom). The OpenAI-compat /v1 endpoint
+# does NOT pass options.num_ctx through, so num_ctx must be set here in the model.
+#
+# Baking a large context window + the model card's recommended sampling directly
+# into the model makes every call (via /v1 or /api) allocate enough room.
+PARAMETER num_ctx 32768
+PARAMETER temperature 1
+PARAMETER top_p 0.95
+PARAMETER top_k 64
