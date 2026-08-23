@@ -285,7 +285,27 @@ class ScratchpadClient:
         return "\n".join(lines)
 
     def run_sweeper(self, session_id: str) -> None:
-        """Triggers the on-demand Louvain L2 sweeper (optional / no-op for now)."""
+        """Deliberate no-op. NOT a broken stub -- see below for why.
+
+        This was meant to periodically Louvain-cluster the graph and
+        collapse each community into an L2 summary row
+        (hierarchy_level=2), marked `[COMPRESSED | drill-down id: ...]` in
+        the bounded view so a caller could ask for it to be expanded.
+        `hierarchy_level` is 100% L1 across every row this project has ever
+        committed (0 rows at L2) because this was never implemented.
+
+        It turned out not to gate the actual capability, though:
+        `drill_down()` below does a k-hop BFS expansion by NODE NAME (or
+        edge_id) over the live graph directly -- it never checks
+        hierarchy_level at all -- so "drill into any suspect's
+        neighbourhood" already works without L2 summaries existing. What
+        L2 compression would add is condensing a large *community* of
+        nodes into one summary row so the bounded view's per-fact budget
+        stretches further on a big graph; it's a scaling optimization for
+        graphs much larger than this project's sessions have needed, not a
+        prerequisite for the drill-down affordance to function. Left as an
+        explicit no-op rather than implemented speculatively.
+        """
         pass
 
     def drill_down(self, session_id: str, edge_id_or_node: str, k_hops: int = 1) -> str:

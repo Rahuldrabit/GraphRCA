@@ -264,9 +264,12 @@ class RCAAnalystAgent:
 
         system_prompt = (
             "You are an expert SRE performing Root Cause Analysis over a knowledge graph. "
-            "You are given suspect services and a token-bounded view of the graph. "
-            "Some facts are compressed and marked `[COMPRESSED | drill-down id: <edge_id>]`; "
-            "you may expand any of them (or any service) to inspect its neighbourhood before deciding. "
+            "You are given suspect services and a token-bounded view of the graph -- the "
+            "view is cut for budget, so some real evidence isn't shown. You may drill into "
+            "ANY service or suspect by name to see its k-hop neighbourhood before deciding "
+            "(some cut facts are also explicitly marked "
+            "`[COMPRESSED | drill-down id: <edge_id>]` when that's available -- drilling by "
+            "either the edge_id or the plain service name works the same way). "
             "Always reply with a SINGLE strict JSON object."
         )
 
