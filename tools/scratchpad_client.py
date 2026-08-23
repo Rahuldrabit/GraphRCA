@@ -231,7 +231,7 @@ class ScratchpadClient:
         try:
             rows = conn.execute(
                 """SELECT source_entity, relationship, target_entity, citation_quote,
-                          relevance_score, hierarchy_level
+                          relevance_score, hierarchy_level, source_type
                    FROM knowledge_graph
                    WHERE session_id = ? AND is_active = 1""",
                 (session_id,),

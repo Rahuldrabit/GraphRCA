@@ -3,6 +3,7 @@ import re
 import csv
 import glob
 import json
+import math
 import logging
 import statistics
 from typing import List, Dict, Any, Optional, Tuple
@@ -31,6 +32,74 @@ def _is_token(node: str) -> bool:
     if not node:
         return True
     return any(node.startswith(p) for p in _TOKEN_PREFIXES)
+
+
+# Static cgroup configuration (limit / shares / quota / period) and period
+# counters. These are NOT behavioural signals: `container_spec_cpu_period` is
+# literally 100000 for every container, and `container_spec_memory_limit_bytes`
+# is the configured cap, not consumption. They used to be pooled together with
+# real usage metrics into one "cpu"/"mem" distribution, which meant the pooled
+# mean sat between the config constants and the usage values, so essentially
+# EVERY service cleared the 2x-mean bar and got flagged HIGH_CPU/HIGH_MEM
+# (observed: 19/19 hotel-reservation services, 31/31 astronomy-shop services,
+# including prometheus/grafana/jaeger). The anomaly signal therefore carried no
+# information and the diagnoser ranked on noise. Usage metrics only, and each
+# metric is now compared against itself.
+_SPEC_METRIC_PREFIXES = ("container_spec_",)
+_SKIP_METRIC_SUFFIXES = ("_periods_total",)
+
+
+# Service roles, written to the ScratchPad `source_type` column (which was
+# previously left 'UNKNOWN' on 99.4% of rows). The diagnoser needs these because
+# comparing raw resource/latency values ACROSS services measures architecture,
+# not fault: a DATASTORE legitimately outweighs an app pod, and an ASYNC_CONSUMER
+# legitimately holds spans open for seconds. Without roles those services top
+# every ranking and bury the real root cause — measured on astronomy-shop, where
+# excluding ASYNC_CONSUMER/OBSERVABILITY moved the true root cause from #3 to #1
+# (ad_service_high_cpu) and #4 to #2 (ad_service_manual_gc).
+_ROLE_PATTERNS = (
+    ("OBSERVABILITY", ("jaeger", "prometheus", "grafana", "otel", "opentelemetry",
+                       "opensearch", "opamp", "telemetry", "loki", "chaos",
+                       "metrics-server", "mcp", "chatbot")),
+    ("LOADGEN", ("load-generator", "loadgenerator", "wrk", "wrk2-job", "locust")),
+    ("BROKER", ("kafka", "rabbitmq", "nats", "zookeeper")),
+    ("DATASTORE", ("mongodb", "mysql", "postgres", "redis", "valkey", "memcached",
+                   "-db", "tidb", "etcd", "consul")),
+    ("GATEWAY", ("frontend-proxy", "frontend-web", "nginx", "istio", "envoy",
+                 "ingress", "loadbalancer")),
+    # Kafka/queue consumers: long-lived spans are their normal mode of operation.
+    ("ASYNC_CONSUMER", ("fraud-detection", "accounting", "email")),
+)
+
+
+def _service_role(name: str) -> str:
+    """Classify a service into a coarse role for role-aware ranking."""
+    n = (name or "").lower()
+    if not n:
+        return "UNKNOWN"
+    for role, needles in _ROLE_PATTERNS:
+        if any(x in n for x in needles):
+            return role
+    return "APP"
+
+
+def _usage_metric_kind(name: str) -> str:
+    """Return 'cpu' | 'mem' for a real usage metric, or '' for one to skip."""
+    n = (name or "").lower()
+    if n.startswith(_SPEC_METRIC_PREFIXES) or n.endswith(_SKIP_METRIC_SUFFIXES):
+        return ""
+    if "cpu" in n:
+        return "cpu"
+    if "mem" in n:
+        return "mem"
+    return ""
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
 
 
 class ObserverAgent:
@@ -190,10 +259,24 @@ class ObserverAgent:
                 avg = statistics.mean(vals)
                 # >2x the global median AND >100 (ms) guards against noise.
                 if avg >= max(100.0, 2.0 * med):
+                    ratio = avg / max(med, 1.0)
+                    # Log-scaled, not linearly clipped: observed ratios span
+                    # 5x-557x on real faults, and a linear cap (old: cap=8)
+                    # pinned everything above ~8x to the same relevance=1.0,
+                    # which meant the strongest signal in the whole incident
+                    # (the actual root cause, often the highest ratio) was
+                    # indistinguishable from a mild symptom once ranked --
+                    # exactly the "27 rows tied at 1.0" failure that starved
+                    # the RCA analyst's token-bounded view of real evidence.
+                    latency_saturate = _env_float("GRAPHRCA_LATENCY_RATIO_SATURATE", 1000.0)
+                    relevance = round(
+                        min(1.0, math.log10(max(ratio, 1.0001)) / math.log10(latency_saturate)),
+                        3,
+                    )
                     triplets.append({
                         "source": svc, "relationship": "blocks", "target": "HIGH_LATENCY",
-                        "citation_quote": f"trace avg_duration={avg:.0f} median={med:.0f}",
-                        "relevance": self._rel(int(avg / max(med, 1.0)), cap=8),
+                        "citation_quote": f"trace avg_duration={avg:.0f} median={med:.0f} ({ratio:.1f}x)",
+                        "relevance": relevance,
                     })
         return triplets
 
@@ -257,13 +340,178 @@ class ObserverAgent:
             })
         return triplets
 
+    @staticmethod
+    def _flag_metric_cross_sectional_outliers(
+        per_metric: Dict[str, Dict[str, List[Tuple[float, float]]]]
+    ) -> List[Dict[str, Any]]:
+        """Flag services sitting >2x the mean *of the same metric*, right now.
+
+        Kept alongside `_flag_metric_temporal_outliers` (below) rather than
+        replaced by it. Measured against real fault sessions
+        (astronomy-shop payment_service_unreachable /
+        product_catalog_service_failure / recommendation_service_cache_failure):
+        the swarm's single `get_metrics(ns, 5)` call fetches a 5-minute
+        window AFTER the fault has already reached steady state -- by the
+        time it's scraped, the faulty service is already flat at its new
+        (elevated) level for the whole window, so a within-window
+        baseline-vs-current comparison sees no transition and misses it
+        entirely. Cross-sectional -- "is this bigger than its peers RIGHT
+        NOW" -- is the only one of the two that can see an already-elevated
+        flat plateau. Verified: temporal-only collapsed to a single false
+        positive (`grafana`, whose cache metric happens to always be
+        climbing within any 5-minute window, unrelated to any fault) and
+        lost the ground truth on all three sessions above.
+
+        Each metric is still compared only against itself (not pooled across
+        metrics) to avoid the original config-constant/counter-pooling bug.
+        Only the strongest deviation per (service, cpu|mem) is emitted.
+        """
+        saturate = _env_float("GRAPHRCA_METRIC_RATIO_SATURATE", 1000.0)
+        best: Dict[Tuple[str, str], Tuple[float, str, float, float]] = {}
+        for metric_name, svc_map in per_metric.items():
+            kind = _usage_metric_kind(metric_name)
+            if not kind:
+                continue
+            all_vals = [v for pts in svc_map.values() for _, v in pts]
+            if not all_vals:
+                continue
+            mean = statistics.mean(all_vals)
+            if mean <= 0:
+                continue
+            for svc, pts in svc_map.items():
+                vals = [v for _, v in pts]
+                if not vals:
+                    continue
+                mx = max(vals)
+                if mx < 2.0 * mean:
+                    continue
+                ratio = mx / mean
+                key = (svc, kind)
+                if key not in best or ratio > best[key][0]:
+                    best[key] = (ratio, metric_name, mx, mean)
+
+        triplets: List[Dict[str, Any]] = []
+        for (svc, kind), (ratio, metric_name, mx, mean) in best.items():
+            # Log-scaled, not linearly clipped -- see the HIGH_LATENCY fix in
+            # parse_traces for the same reasoning: a linear cap pinned every
+            # service above ~5x the mean to the same relevance=1.0, so the
+            # ranking carried no magnitude information at all.
+            relevance = round(min(1.0, math.log10(max(ratio, 1.0001)) / math.log10(saturate)), 3)
+            triplets.append({
+                "source": svc,
+                "relationship": "emits",
+                "target": "HIGH_CPU" if kind == "cpu" else "HIGH_MEM",
+                "citation_quote": f"metric {metric_name} max={mx:.3f} mean={mean:.3f} ({ratio:.1f}x, cross-sectional)",
+                "relevance": relevance,
+            })
+        return triplets
+
+    @staticmethod
+    def _flag_metric_temporal_outliers(
+        per_metric: Dict[str, Dict[str, List[Tuple[float, float]]]]
+    ) -> List[Dict[str, Any]]:
+        """Flag services whose OWN metric history just changed.
+
+        The old version compared every service's value against the mean of
+        ALL services for that metric at one instant. That measures
+        architecture, not fault: a mongodb/kafka/opensearch legitimately
+        sits at higher CPU/mem than an app pod all the time, so it (and every
+        other datastore/broker/observability pod) cleared the "2x the mean"
+        bar on nearly every run regardless of whether anything was actually
+        wrong -- observed as ~22 of 23 services flagged anomalous on healthy
+        and faulty runs alike, which made the anomaly signal roughly
+        uninformative and also broke detection (any() over "is anything
+        anomalous" was ~always true).
+
+        This version instead compares each (service, metric) time series
+        against ITSELF: the values in the tail "current" window vs. the
+        values in the earlier "baseline" window, using a z-score. A fault is
+        a service's OWN trend changing mid-window, not a service being
+        intrinsically bigger than its neighbours. Needs the timestamp column
+        (kept in `swarm_agent_aiopslab.py::_collect_metrics`) or, absent
+        that, the caller's row order — Prometheus scrape rows are already
+        chronological, so row order is an acceptable stand-in for a real
+        timestamp.
+
+        Only the strongest |z| per (service, cpu|mem) is emitted, so one
+        service isn't scored several times over for correlated metrics all
+        moving together.
+        """
+        z_thresh = _env_float("GRAPHRCA_METRIC_Z_THRESH", 3.0)
+        # Above this |z| the relevance score saturates at 1.0. Chosen well
+        # above z_thresh so magnitude still discriminates between a
+        # marginal outlier (z~3-5) and a severe one (z~15+) instead of
+        # every flagged service piling up at relevance=1.0 -- that
+        # saturation was a second, independent source of the "8
+        # undifferentiated suspects" problem: even when the anomaly WAS
+        # real, its strength got clipped away before the diagnoser/RCA
+        # ever saw it.
+        saturate = _env_float("GRAPHRCA_METRIC_Z_SATURATE", 15.0)
+        min_points = 6  # need enough samples to split baseline vs current meaningfully
+
+        best: Dict[Tuple[str, str], Tuple[float, str, float, float]] = {}
+        for metric_name, svc_map in per_metric.items():
+            kind = _usage_metric_kind(metric_name)
+            if not kind:
+                continue
+            for svc, points in svc_map.items():
+                pts = sorted(points, key=lambda p: p[0])
+                vals = [v for _, v in pts]
+                if len(vals) < min_points:
+                    continue
+                # Current = last 30% of samples (min 3); baseline = the rest
+                # (min 3). A short, recent-weighted current window catches a
+                # fault that started partway through the scrape without
+                # needing it to dominate the whole window.
+                current_n = max(3, int(len(vals) * 0.3))
+                current_n = min(current_n, len(vals) - 3)
+                if current_n < 3:
+                    continue
+                baseline = vals[:-current_n]
+                current = vals[-current_n:]
+                b_mean = statistics.mean(baseline)
+                b_std = statistics.pstdev(baseline) if len(baseline) > 1 else 0.0
+                # A baseline that is EXACTLY zero for its whole window (many
+                # near-idle counters like container_memory_cache legitimately
+                # sit at 0 until something first touches the page cache) has
+                # no established trend at all -- any tiny nonzero blip in the
+                # current window then divides by the 1e-6 floor and produces
+                # a z in the billions, which is noise, not signal. Skip it;
+                # there's nothing to compare "own history" against.
+                if b_mean == 0.0 and b_std == 0.0:
+                    continue
+                # Floor the denominator so a near-constant NONZERO baseline
+                # (b_std ~0) doesn't blow z up unboundedly on a modest move.
+                b_std_floor = max(b_std, abs(b_mean) * 0.05, 1e-6)
+                c_mean = statistics.mean(current)
+                z = (c_mean - b_mean) / b_std_floor
+                if abs(z) < z_thresh:
+                    continue
+                key = (svc, kind)
+                if key not in best or abs(z) > abs(best[key][0]):
+                    best[key] = (z, metric_name, c_mean, b_mean)
+
+        triplets: List[Dict[str, Any]] = []
+        for (svc, kind), (z, metric_name, c_mean, b_mean) in best.items():
+            triplets.append({
+                "source": svc,
+                "relationship": "emits",
+                "target": "HIGH_CPU" if kind == "cpu" else "HIGH_MEM",
+                "citation_quote": (
+                    f"metric {metric_name} current={c_mean:.3f} baseline={b_mean:.3f} "
+                    f"(z={z:.1f}, own-history)"
+                ),
+                "relevance": round(min(1.0, abs(z) / saturate), 3),
+            })
+        return triplets
+
     def parse_metrics(self, metrics_path_or_text: str) -> List[Dict[str, Any]]:
         """Parse Prometheus metrics CSV(s) into triplets.
 
         Accepts either the combined summary CSV produced by the swarm fetcher
         (columns: metric,cmdb_id,kpi_name,value) or a metrics directory.
-        Flags services with anomalously high CPU / memory values (>2x the
-        per-metric mean). Best-effort: returns [] if the format is unexpected.
+        Flags services whose value is >2x the mean *of that same metric*.
+        Best-effort: returns [] if the format is unexpected.
         """
         triplets: List[Dict[str, Any]] = []
         text, was_file = self._read_text(metrics_path_or_text)
@@ -275,7 +523,7 @@ class ObserverAgent:
             return self._parse_metrics_dir(metrics_path_or_text.strip())
 
         rows: List[Dict[str, str]] = []
-        # Combined summary CSV (metric,cmdb_id,kpi_name,value)
+        # Combined summary CSV (metric,cmdb_id,kpi_name,value[,timestamp])
         if "cmdb_id" in text or "kpi_name" in text:
             try:
                 reader = csv.DictReader(text.strip().split("\n"))
@@ -283,9 +531,14 @@ class ObserverAgent:
             except Exception:
                 rows = []
 
-        # per-metric aggregated values: {metric_kind: {svc: [values]}}
-        agg: Dict[str, Dict[str, List[float]]] = {}
-        for r in rows:
+        # Keyed by the EXACT metric name so each metric is compared against
+        # itself over time: {metric_name: {svc: [(timestamp, value), ...]}}
+        # If the CSV predates the timestamp column (or a value is
+        # unparseable), fall back to row order -- the source kpi_*.csv rows
+        # are already chronological, so enumeration order is still a valid
+        # (if less precise) time axis.
+        agg: Dict[str, Dict[str, List[Tuple[float, float]]]] = {}
+        for i, r in enumerate(rows):
             kpi = (r.get("kpi_name") or r.get("metric") or "").lower()
             svc = self._canonical_svc(self._svc_from_cmdb(r.get("cmdb_id", "")))
             try:
@@ -294,69 +547,72 @@ class ObserverAgent:
                 continue
             if not svc or val != val:  # NaN check
                 continue
-            kind = "cpu" if "cpu" in kpi else "mem" if "mem" in kpi else ""
-            if not kind:
+            if not _usage_metric_kind(kpi):
                 continue
-            agg.setdefault(kind, {}).setdefault(svc, []).append(val)
+            try:
+                ts = float(r.get("timestamp", "nan"))
+                if ts != ts:  # NaN
+                    raise ValueError
+            except (TypeError, ValueError):
+                ts = float(i)
+            agg.setdefault(kpi, {}).setdefault(svc, []).append((ts, val))
 
-        for kind, svc_map in agg.items():
-            all_vals = [v for vals in svc_map.values() for v in vals]
-            if not all_vals:
-                continue
-            mean = statistics.mean(all_vals)
-            for svc, vals in svc_map.items():
-                if not vals:
-                    continue
-                mx = max(vals)
-                if mx >= 2.0 * mean and mean > 0:
-                    target = "HIGH_CPU" if kind == "cpu" else "HIGH_MEM"
-                    triplets.append({
-                        "source": svc, "relationship": "emits", "target": target,
-                        "citation_quote": f"metric {kind} max={mx:.3f} mean={mean:.3f}",
-                        "relevance": self._rel(int(mx / max(mean, 1e-9)), cap=5),
-                    })
-        return triplets
+        return self._flag_metric_outliers(agg)
+
+    @staticmethod
+    def _flag_metric_outliers(
+        per_metric: Dict[str, Dict[str, List[Tuple[float, float]]]]
+    ) -> List[Dict[str, Any]]:
+        """Union of the cross-sectional and temporal metric detectors.
+
+        Neither alone is sufficient (see the docstrings on each): the
+        cross-sectional channel catches a service already flat at an
+        elevated level for the whole scrape window (the common case, since
+        metrics are fetched after the fault has settled); the temporal
+        channel catches one still actively changing within the window. Emit
+        both; when they agree on the same (service, kind), keep whichever
+        scored the signal as more relevant.
+        """
+        combined: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for t in (
+            ObserverAgent._flag_metric_cross_sectional_outliers(per_metric)
+            + ObserverAgent._flag_metric_temporal_outliers(per_metric)
+        ):
+            k = (t["source"], t["relationship"], t["target"])
+            if k not in combined or t.get("relevance", 0) > combined[k].get("relevance", 0):
+                combined[k] = t
+        return list(combined.values())
 
     def _parse_metrics_dir(self, dirpath: str) -> List[Dict[str, Any]]:
-        triplets: List[Dict[str, Any]] = []
         csvs = glob.glob(os.path.join(dirpath, "**", "kpi_*.csv"), recursive=True)
-        kind_map = {"cpu": [], "mem": []}
+        # Keyed by the EXACT metric name (the kpi_<name>.csv filename) so each
+        # metric is compared against itself over time:
+        # {metric_name: {svc: [(timestamp, value), ...]}}
+        agg: Dict[str, Dict[str, List[Tuple[float, float]]]] = {}
         for c in csvs[:40]:
             metric = os.path.basename(c)[4:-4].lower()
-            kind = "cpu" if "cpu" in metric else "mem" if "mem" in metric else None
-            if not kind:
+            if not _usage_metric_kind(metric):
                 continue
             try:
                 with open(c, encoding="utf-8", errors="replace") as f:
-                    for r in csv.reader(f):
-                        if len(r) >= 4:
-                            kind_map[kind].append((r[1], r[2], r[3]))  # cmdb, kpi, value
+                    for i, r in enumerate(csv.reader(f)):
+                        if len(r) < 4:
+                            continue
+                        svc = self._canonical_svc(self._svc_from_cmdb(r[1]))
+                        try:
+                            v = float(r[3])
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            ts = float(r[0])
+                        except (TypeError, ValueError):
+                            ts = float(i)
+                        if svc and v == v:  # NaN check
+                            agg.setdefault(metric, {}).setdefault(svc, []).append((ts, v))
             except Exception:
                 continue
 
-        for kind, recs in kind_map.items():
-            agg: Dict[str, List[float]] = {}
-            for cmdb, _kpi, val in recs:
-                svc = self._canonical_svc(self._svc_from_cmdb(cmdb))
-                try:
-                    v = float(val)
-                except (TypeError, ValueError):
-                    continue
-                if svc and v == v:
-                    agg.setdefault(svc, []).append(v)
-            allv = [v for vs in agg.values() for v in vs]
-            if not allv:
-                continue
-            mean = statistics.mean(allv)
-            for svc, vs in agg.items():
-                if vs and max(vs) >= 2.0 * mean and mean > 0:
-                    target = "HIGH_CPU" if kind == "cpu" else "HIGH_MEM"
-                    triplets.append({
-                        "source": svc, "relationship": "emits", "target": target,
-                        "citation_quote": f"metric {kind} max={max(vs):.3f} mean={mean:.3f}",
-                        "relevance": self._rel(int(max(vs) / max(mean, 1e-9)), cap=5),
-                    })
-        return triplets
+        return self._flag_metric_outliers(agg)
 
     @staticmethod
     def _svc_from_cmdb(cmdb: str) -> str:
@@ -511,6 +767,12 @@ class ObserverAgent:
             if k not in dedup or t.get("relevance", 0) > dedup[k].get("relevance", 0):
                 dedup[k] = t
         triplets = list(dedup.values())
+
+        # Stamp the service role so the diagnoser can rank role-aware (and so the
+        # role survives in the ScratchPad for anything reading the graph later).
+        for t in triplets:
+            if not _is_token(t["source"]) and t["source"] != "SYSTEM":
+                t.setdefault("source_type", _service_role(t["source"]))
 
         try:
             self.client.init_session(session_id, goal=state.get("problem_id", ""))

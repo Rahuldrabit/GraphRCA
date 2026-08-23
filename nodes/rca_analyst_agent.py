@@ -32,6 +32,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # gemma4-graphrca:12b. Tunable per-run without a code edit.
 RCA_MAX_TOKENS = _env_int("GRAPHRCA_RCA_MAX_TOKENS", 8192)
 
+# Token budget for the single-shot RCA view (`get_view`). The hardcoded 500
+# used here dropped 62/73 facts on a real session, including 2/8 suspects
+# (sometimes the ground truth itself) — a compression the model's
+# num_ctx=32768 never required. The engine's own default budget is ~6192;
+# match that so the RCA analyst sees the same graph the diagnoser reasoned
+# over instead of an arbitrarily narrower cut.
+RCA_VIEW_TOKENS = _env_int("GRAPHRCA_RCA_VIEW_TOKENS", 6192)
+
 
 def _balanced_objects(s: str):
     """Yield each top-level balanced {...} substring in s (string/escape-aware)."""
@@ -174,7 +182,7 @@ class RCAAnalystAgent:
 
     def _single_shot(self, state: AIOpsIncidentState, session_id: str, suspects: List[str]) -> AIOpsIncidentState:
         # Get bounded markdown view
-        markdown_view = self.client.get_view(session_id, max_tokens=500)
+        markdown_view = self.client.get_view(session_id, max_tokens=RCA_VIEW_TOKENS)
 
         system_prompt = (
             "You are an expert Site Reliability Engineer (SRE) performing Root Cause Analysis. "
