@@ -40,7 +40,7 @@ trace_ingest → graph_builder → detection → memory_search
 | 2 — Causal | Advanced causal inference & temporal ordering | `causal_ranker` |
 | 3 — Observability | eBPF + log pattern deep-dive | `log_pattern` |
 | 4 — Benchmark | AIOpsLab integration (detection / localization / analysis / mitigation) | `agent_aiopslab` |
-> [!NOTE] **v5.1/v5.2** – Added a read‑only `/v1/session/{id}/variables/raw` endpoint for deterministic routing, introduced Guard & Archivist agents, and separated the SLM markdown path from the deterministic path.
+
 ---
 ## New Scratchpad Endpoint & Agent Design
 
@@ -49,7 +49,7 @@ trace_ingest → graph_builder → detection → memory_search
 - **`agents/archivist.py`** builds the final submit call using the structured read.
 - **`GraphRCAAgentV5`** routes deterministic checks through the new endpoint and uses Guard before invoking the SLM path.
 - **Design overview**: deterministic path → structured read → Guard → optional LLM sync → action.
-
+Link : https://github.com/Rahuldrabit/ScrathPad
 ---
 
 ### ScratchPad 4-Agent Swarm (New)
@@ -533,8 +533,7 @@ python eval/clean_ansi_from_log.py path/to/run.log
 | `run_logs.txt` | Per-attempt summary (start/end time, task type, validation, reflection) |
 | `graphrca_run_stats.json` | Token totals (prompt/completion/total), run count, elapsed seconds |
 | `eval_results.json` | Raw AIOpsLab evaluation metrics (Detection Accuracy, TTD, steps, tokens) |
-| `reports/diagnosis_struct_out.json` | ITBench-compatible diagnosis output |
-| `reports/remediation_struct_out.json` | ITBench-compatible remediation output |
+
 
 ### LLM Justification Log format
 
@@ -679,10 +678,9 @@ Backward traversal walks **upstream** from the primary error service on the serv
 
 Each candidate service gets a **multi-signal confidence score** (error, latency z-score, alert score, call volume, and a small depth boost), then candidates are sorted by `confidence` descending.
 
-### TNR Rollback Loop (Pillar 1)
-After mitigation, the weighted health score $\mu(s)$ is computed again. If health regresses (default: $\mu(s)_{after} > \mu(s)_{before} + 0.05$), rollback is triggered and RCA restarts (up to 3 times).
 
-### Causal Ranking (Pillar 2)
+
+### Causal Ranking 
 Re-ranks BFS results using a combined score:
 
 `combined = α·BFS_confidence + β·temporal_priority + γ·causal_score` (defaults: `α=0.50`, `β=0.25`, `γ=0.25`, `lag=5`, causal scoring on top `8` candidates).
