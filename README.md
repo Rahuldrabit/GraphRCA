@@ -1,6 +1,26 @@
-# GraphRCA — Autonomous SRE with Knowledge Graphs and an LLM Multi-Agent Pipeline
+# Scaling Small Language Models for Autonomous Site Reliability Engineering Through Externalized Memory and Planning (GraphRCA)
 
-A **standalone** multi-agent system for root cause analysis, anomaly detection, and autonomous mitigation in distributed systems.
+<p align="center">
+  <a href="https://openreview.net/attachment?id=sTkyhw9th6&name=pdf"><img src="https://img.shields.io/badge/Paper-PDF-red.svg" alt="Paper PDF"></a>
+  <a href="https://openreview.net/revisions?id=sTkyhw9th6"><img src="https://img.shields.io/badge/OpenReview-Forum-blue.svg" alt="OpenReview"></a>
+  <a href="https://creativecommons.org/licenses/by/4.0/"><img src="https://img.shields.io/badge/License-CC_BY_4.0-lightgrey.svg" alt="License: CC BY 4.0"></a>
+  <img src="https://img.shields.io/badge/Venue-AAAI_2027_IAAI-purple.svg" alt="Venue: AAAI 2027 IAAI">
+</p>
+
+> **[Rahul Drabit Chowdhury](https://openreview.net/profile?id=~Rahul_Drabit_Chowdhury1)¹**, **[Muhammad Abdullah Adnan](https://openreview.net/profile?id=~Muhammad_Abdullah_Adnan1)¹**  
+> ¹ *Bangladesh University of Engineering and Technology (buet.ac.bd)*  
+> *AAAI 2027 Innovative Applications of AI (IAAI) Submission (#72) — Track 3a: Deployment Insights*  
+> **Links**: [[Paper PDF](https://openreview.net/attachment?id=sTkyhw9th6&name=pdf)] &bull; [[OpenReview Forum](https://openreview.net/revisions?id=sTkyhw9th6)]
+
+---
+
+### Abstract
+
+Autonomous multi-agent systems for Site Reliability Engineering (SRE) typically depend on frontier language models, whose large context windows support long, multi-step incident investigations. Small language models (SLMs) offer lower inference cost, local deployment, and stronger data locality, but are more vulnerable to context saturation, persistent hallucinated state, and repeated use of probabilistic inference for operations that admit deterministic algorithms. We present **GraphRCA**, an autonomous SRE architecture that externalizes persistent memory and substantial portions of planning into **ScratchPad**, a verified graph-memory middleware. ScratchPad converts observations into typed graph facts, verifies model-generated writes against source evidence before persistence, tracks unresolved task variables, canonicalizes entity identities, retrieves query-local graph neighborhoods, and greedily compiles a token-bounded working view for the SLM. Dense graph regions can be replaced by recoverable Level-2 summaries with lineage-preserving drill-down, while retry-prone reasoning can occur in private memory sessions and be promoted to shared state only after confirmation. Deterministic components read structured state directly, avoiding unnecessary serialize–infer–parse cycles. We evaluate GraphRCA on 67 successfully provisioned live Kubernetes incidents using a locally served Gemma 4 12B model. The system obtains 92.3% success on 26 detection tasks, 34.8% localization accuracy, and correct root-cause service identification in 6/8 evaluated analysis tasks. A controlled synthetic long-horizon test increases causal-chain completeness from 40% without ScratchPad to 84% with it. These results suggest that externalized state management and deterministic algorithmic offloading can preserve useful autonomous SRE capability under constrained local inference while exposing clear remaining challenges in ontology conformance and remediation reliability.
+
+**Keywords**: Small Language Models (SLMs), Autonomous Multi-Agent Systems, Site Reliability Engineering (SRE), Long-Horizon Reasoning, Deterministic Planning, AIOps.
+
+---
 
 
 
@@ -723,10 +743,14 @@ See LICENSE file in repository root.
 
 ## Citation
 
-If you use GraphRCA in your research, please cite the GraphRCA paper:
+If you use GraphRCA or ScratchPad in your research, please cite:
 
 ```bibtex
-@inproceedings{GraphRCA,
-  title={GraphRCA: Autonomous SRE with Knowledge Graphs and an LLM Multi-Agent Pipeline},
+@inproceedings{chowdhury2026scaling,
+  title={Scaling Small Language Models for Autonomous Site Reliability Engineering Through Externalized Memory and Planning},
+  author={Chowdhury, Rahul Drabit and Adnan, Muhammad Abdullah},
+  booktitle={AAAI 2027 Innovative Applications of AI (IAAI)},
+  year={2026},
+  url={https://openreview.net/attachment?id=sTkyhw9th6&name=pdf}
 }
 ```
