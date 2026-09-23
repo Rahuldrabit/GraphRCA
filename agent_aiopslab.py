@@ -163,25 +163,47 @@ class GraphRCAAgent:
           yinfangchen/geo:app3
         This attempts to roll it back to:
           yinfangchen/hotelreservation:latest
+
+        Disclosure: this hardcodes the answer to one specific benchmark fault
+        (image name included) and previously ran unconditionally, silently
+        producing this project's only real mitigation "pass" while every
+        record looked like ordinary agent-executed remediation. It is now
+        OFF by default -- set GRAPHRCA_ENABLE_HOTELRES_SAFETY_NET=True to
+        re-enable it as an explicit, opt-in net -- and every command it does
+        run is tagged `hardcoded_safety_net: True` so it can be excluded
+        from any agent-capability accounting.
         """
         if self.namespace != "test-hotel-reservation":
             return []
+        if os.getenv("GRAPHRCA_ENABLE_HOTELRES_SAFETY_NET", "False").strip().lower() not in (
+            "1", "true", "yes", "on"
+        ):
+            return []
+
+        def _tag(rec: dict) -> dict:
+            rec["hardcoded_safety_net"] = True
+            return rec
 
         executed: list[dict] = []
 
         image = self._run_kubectl('kubectl get deployment geo -o jsonpath="{.spec.template.spec.containers[0].image}"')
-        executed.append({"command": "kubectl get deployment geo -o jsonpath=...", "output": _preview_text(image, 800)})
+        executed.append(_tag({"command": "kubectl get deployment geo -o jsonpath=...", "output": _preview_text(image, 800)}))
 
         if "yinfangchen/geo:app3" not in (image or ""):
             return executed
 
+        logger.warning(
+            "[SafetyNet] Applying hardcoded hotelres geo-image fix "
+            "(GRAPHRCA_ENABLE_HOTELRES_SAFETY_NET=True) -- this is NOT agent "
+            "reasoning; exclude from capability scoring."
+        )
         fix_cmd = "kubectl set image deployment/geo hotel-reserv-geo=yinfangchen/hotelreservation:latest"
         out = self._run_kubectl(fix_cmd)
-        executed.append({"command": fix_cmd, "output": _preview_text(out, 2000)})
+        executed.append(_tag({"command": fix_cmd, "output": _preview_text(out, 2000)}))
 
         status_cmd = "kubectl rollout status deployment/geo --timeout=180s"
         out2 = self._run_kubectl(status_cmd)
-        executed.append({"command": status_cmd, "output": _preview_text(out2, 2000)})
+        executed.append(_tag({"command": status_cmd, "output": _preview_text(out2, 2000)}))
         return executed
 
     def _execute_mitigation_plan(self, report: dict) -> list[dict]:
@@ -359,9 +381,43 @@ class GraphRCAAgent:
             pass
         return response
 
-    def _clean_aiopslab_text(self, text: str) -> str:
+    def _clean_aiopslab_text(self, text) -> str:
+        """Normalize an AIOpsLab response into real, multi-line text.
+
+        AIOpsLab's orchestrator often returns actual `bytes` for log/exec
+        output (e.g. get_logs), which upstream code has been stringifying
+        with str()/f"..." instead of decoding -- producing a literal
+        "b'...\\n...'" repr with escaped \\n sequences instead of real
+        newlines. Every downstream line-oriented parser (parse_logs and
+        friends, which do `text.split("\\n")`) then sees ONE line per
+        service no matter how many real lines it contains, so error/timeout/
+        connection-refused counts are capped at 1 and the log channel enters
+        the ScratchPad at floor relevance. Handle both the real-bytes case
+        and the already-stringified-repr case here, once, for every caller.
+        """
+        if text is None:
+            return ""
+        if isinstance(text, bytes):
+            return text.decode("utf-8", "replace").replace(
+                "\nPlease take the next action", ""
+            ).strip()
+        text = str(text)
         if not text:
             return ""
+        stripped = text.strip()
+        if (
+            len(stripped) >= 2
+            and stripped[0] in "bB"
+            and stripped[1] in "'\""
+            and stripped[-1] == stripped[1]
+        ):
+            try:
+                import ast
+                decoded = ast.literal_eval(stripped)
+                if isinstance(decoded, bytes):
+                    text = decoded.decode("utf-8", "replace")
+            except Exception:
+                pass  # not actually a bytes-repr; fall through unchanged
         # AIOpsLab sometimes appends this suffix; strip for parsing.
         text = text.replace("\nPlease take the next action", "")
         return text.strip()

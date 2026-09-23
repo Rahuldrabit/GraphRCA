@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import logging
@@ -7,12 +8,43 @@ from llm import llm_reason
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+# Token budget for the evidence view handed to the analysis classifier.
+# Previously this call got NO telemetry at all -- just the bare root-cause
+# service name string -- and had to guess system_level/fault_type with no
+# evidence to ground the guess in. That's why it echoed the prompt's own
+# example ("Application"/"Code Defect") on every single analysis task this
+# session regardless of the true fault.
+ANALYSIS_VIEW_TOKENS = _env_int("GRAPHRCA_ANALYSIS_VIEW_TOKENS", 3000)
+
+# Completion-token budget for this node's LLM call (analysis classification
+# and mitigation command proposal). Verified against GraphRCA/logs/
+# llm_justification.jsonl: EVERY guardrail_actuator call this project has
+# ever made -- 11/11 analysis, 100% of mitigation -- returned an empty
+# response at the old max_tokens=200. gemma4-graphrca is a "thinking" model
+# whose reasoning trace burns through a small completion budget before it
+# can emit the JSON answer (the same failure mode already fixed once for
+# rca_analyst's RCA_MAX_TOKENS). 200 tokens never gave it a chance to
+# finish reasoning, so this call has been silently 100% non-functional --
+# every analysis/mitigation result on record fell through to
+# _set_default_submission, not to the model's own judgement.
+GUARDRAIL_MAX_TOKENS = _env_int("GRAPHRCA_GUARDRAIL_MAX_TOKENS", 8192)
+
+
 class GuardrailActuator:
     """
     SLM + deterministic safety regex.
     Decides the final AIOpsLab submission or mitigation command.
     """
-    def __init__(self):
+    def __init__(self, scratchpad_client=None):
+        self.client = scratchpad_client
         # Patterns that are absolutely forbidden
         self.forbidden_patterns = [
             r"rm\s+-rf",
@@ -60,21 +92,59 @@ class GuardrailActuator:
         elif task_type == "localization":
             user_prompt = f"Return JSON: {{\"submission\": [\"{root_cause}\"]}}"
         elif task_type == "analysis":
+            # Ground the classification in the same evidence the RCA analyst
+            # used, scoped to the root-cause service via the query-aware
+            # boost, instead of asking the model to invent a fault_type from
+            # a bare service-name string with no telemetry at all.
+            evidence = "(no ScratchPad evidence available for this session)"
+            session_id = state.get("scratchpad_session_id")
+            if self.client and session_id:
+                try:
+                    evidence = self.client.get_view(
+                        session_id, max_tokens=ANALYSIS_VIEW_TOKENS, query=root_cause
+                    )
+                except Exception as e:
+                    logger.warning(f"[Guardrail] failed to fetch evidence view: {e}")
             user_prompt = (
+                f"Evidence for {root_cause}:\n{evidence}\n\n"
+                "Using ONLY the evidence above, classify this incident.\n"
                 "Return JSON with 'system_level' (Hardware|Operating System|Virtualization|Application) "
-                "and 'fault_type' (Misconfiguration|Code Defect|Authentication Issue|Network/Storage Issue|Operation Error|Dependency Problem). "
-                f"Example: {{\"submission\": {{\"system_level\": \"Application\", \"fault_type\": \"Code Defect\"}}}}"
+                "and 'fault_type' (Misconfiguration|Code Defect|Authentication Issue|Network/Storage Issue|Operation Error|Dependency Problem).\n"
+                "Respond in this exact shape, replacing each placeholder with "
+                "one option from its list above -- do not copy this shape's words verbatim:\n"
+                '{"submission": {"system_level": "<system_level choice>", "fault_type": "<fault_type choice>"}}'
             )
         elif task_type == "mitigation":
+            # Same evidence-starvation problem as analysis: without the
+            # namespace or the actual anomaly evidence, the model can't
+            # produce anything but a generic health-check command. Give it
+            # both -- `problem_id` carries the k8s namespace here (see
+            # swarm_agent_aiopslab.py's `problem_id=self.namespace`).
+            namespace = state.get("problem_id", "")
+            evidence = "(no ScratchPad evidence available for this session)"
+            session_id = state.get("scratchpad_session_id")
+            if self.client and session_id:
+                try:
+                    evidence = self.client.get_view(
+                        session_id, max_tokens=ANALYSIS_VIEW_TOKENS, query=root_cause
+                    )
+                except Exception as e:
+                    logger.warning(f"[Guardrail] failed to fetch evidence view: {e}")
             user_prompt = (
-                f"The root cause is {root_cause}. Propose a kubectl mitigation command. "
-                "Return JSON: {\"command\": \"kubectl ...\"}"
+                f"Namespace: {namespace}\n"
+                f"Evidence for {root_cause}:\n{evidence}\n\n"
+                f"Propose ONE kubectl command that corrects the root cause in "
+                f"'{root_cause}' (not just a status check) -- e.g. fixing a bad "
+                f"image, restoring a deleted resource, scaling a deployment back "
+                f"up, or similar, based on what the evidence above actually shows. "
+                f"Always target namespace '{namespace}' explicitly with -n.\n"
+                'Return JSON: {"command": "kubectl ..."}'
             )
             
         response = llm_reason(
             prompt=user_prompt,
             system_prompt=system_prompt,
-            max_tokens=200,
+            max_tokens=GUARDRAIL_MAX_TOKENS,
             caller="guardrail_actuator"
         )
         

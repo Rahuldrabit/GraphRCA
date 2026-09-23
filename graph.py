@@ -240,7 +240,7 @@ def build_scratchpad_swarm_graph() -> StateGraph:
     observer = ObserverAgent(client)
     diagnoser = TopologicalDiagnoser(client)
     rca = RCAAnalystAgent(client)
-    guardrail = GuardrailActuator()
+    guardrail = GuardrailActuator(client)
 
     workflow.add_node("observer_agent", observer)
     workflow.add_node("topological_diagnoser", diagnoser)

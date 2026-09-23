@@ -22,6 +22,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(os.getenv(name, str(default))).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+# Discount applied to a caller's own anomaly score when it calls another
+# anomalous service (see the caller-suppression block below). 0.5, not 0 --
+# a caller showing symptoms because its callee is broken is the common
+# case, but the caller can genuinely ALSO be independently broken, so this
+# is a heuristic demotion, not disqualification.
+_CALLER_SUPPRESSION_FACTOR = _env_float("GRAPHRCA_CALLER_SUPPRESSION_FACTOR", 0.5)
+
+
 # Confidence multipliers applied to the deterministic anomaly score. Mirrors
 # tools/pipeline/llm_scorer.py (the legacy `pipeline` mode's scorer, which the
 # swarm graph never reaches). Classification only ever REORDERS candidates —
@@ -195,6 +210,31 @@ class TopologicalDiagnoser:
             w *= max(rel, 0.1) * _ROLE_PRIORS.get(roles.get(src, "UNKNOWN"), 1.0)
             anomaly_score[src] = anomaly_score.get(src, 0.0) + w
 
+        # Symptom suppression: no caller/callee awareness existed before this
+        # -- the ranking picked whichever service had the loudest raw
+        # magnitude, even when that magnitude was a downstream symptom of a
+        # caller's own broken dependency (verified case: a service calling
+        # into an unreachable/broken callee shows its own elevated
+        # latency/errors purely from waiting on it). If an anomalous service
+        # calls another anomalous service, discount the CALLER -- the
+        # callee is the more likely origin, since fault propagation runs
+        # callee-breaks -> caller-looks-bad, not the other direction (this
+        # matches the graph's own PageRank edge direction above: `calls`
+        # is reversed callee->caller specifically to model that).
+        # Known limitation: this does NOT help (and can mildly hurt) cases
+        # where the true root cause's own broken outbound connection gets
+        # attributed to the far side of the call as the target's latency --
+        # a trace span-attribution issue, not an anomaly-ranking one; that
+        # needs a fix in the observer's trace parser, not here.
+        callees: dict = {}
+        for t in triplets:
+            if t["relationship"] == "calls":
+                callees.setdefault(t["source_entity"], set()).add(t["target_entity"])
+
+        for src in list(anomaly_score.keys()):
+            if any(callee in anomaly_score for callee in callees.get(src, ())):
+                anomaly_score[src] *= _CALLER_SUPPRESSION_FACTOR
+
         pagerank_scores: dict = {}
         try:
             if len(G.nodes) > 0:
@@ -228,6 +268,43 @@ class TopologicalDiagnoser:
                 suspects = self._llm_rerank(suspects, triplets, anomaly_score)
             except Exception as e:
                 logger.warning(f"[Diagnoser] LLM re-rank failed ({e}); keeping deterministic order")
+
+        # Persist the ranking, not just the membership list. Verified
+        # against the live ScratchPad DB: TopologicalDiagnoser had committed
+        # 0 of 5720 rows -- this ranking only ever lived in transient
+        # LangGraph state, so the RCA analyst's get_view() rebuilt its
+        # picture from raw ObserverAgent facts and never saw which suspect
+        # this node actually considered most likely. Committing it as
+        # `ranked` triplets (tiered as evidence in
+        # ScratchPad/src/engine.py's _apply_query_aware_boost, same tier as
+        # emits/blocks) means a token-bounded view can surface "diagnoser
+        # thinks X is #1" even when X's raw emits/blocks evidence itself got
+        # cut for budget.
+        try:
+            session_id = state.get("scratchpad_session_id")
+            if session_id and suspects:
+                n = len(suspects)
+                rank_triplets = [
+                    {
+                        "source": svc,
+                        "relationship": "ranked",
+                        "target": f"SUSPECT_RANK_{i + 1}",
+                        "citation_quote": (
+                            f"topological diagnoser rank {i + 1}/{n}, "
+                            f"anomaly_score={anomaly_score.get(svc, 0.0):.2f}, "
+                            f"role={roles.get(svc, 'UNKNOWN')}"
+                        ),
+                        "source_type": roles.get(svc, "UNKNOWN"),
+                        # Highest-ranked suspect gets relevance 1.0, decaying
+                        # by position so the view's ordering still reflects
+                        # the diagnoser's confidence, not just membership.
+                        "relevance": round(max(0.1, 1.0 - (i / max(n, 1)) * 0.9), 3),
+                    }
+                    for i, svc in enumerate(suspects)
+                ]
+                self.client.commit_triplets(session_id, "TopologicalDiagnoser", rank_triplets)
+        except Exception as e:
+            logger.warning(f"[Diagnoser] failed to persist ranking: {e}")
 
         state["suspect_nodes"] = suspects
         return state

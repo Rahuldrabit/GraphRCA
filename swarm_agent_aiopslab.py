@@ -139,14 +139,22 @@ class SwarmGraphRCAAgent(GraphRCAAgent):
             return
         out = os.path.join(trace_dir, "metrics_summary.csv")
         with open(out, "w", encoding="utf-8") as f:
-            f.write("metric,cmdb_id,kpi_name,value\n")
+            # Keep the timestamp (row[0]) so the observer can compare each
+            # service's metric history against ITSELF over time, instead of
+            # only against other services at one instant. Dropping it here
+            # was the reason temporal (EWMA/z-score) detection was unreachable
+            # from the swarm path even though it collapses to cross-sectional
+            # noise -- a datastore/broker is always "big" next to an app pod,
+            # fault or not, but only a real fault changes a service's OWN
+            # trend over the scrape window.
+            f.write("metric,cmdb_id,kpi_name,value,timestamp\n")
             for c in csvs[:40]:
                 metric = os.path.basename(c)[4:-4]
                 try:
                     with open(c, encoding="utf-8", errors="replace") as fr:
                         for row in csv.reader(fr):
                             if len(row) >= 4:
-                                f.write(f"{metric},{row[1]},{row[2]},{row[3]}\n")
+                                f.write(f"{metric},{row[1]},{row[2]},{row[3]},{row[0]}\n")
                 except Exception:
                     continue
         tel["metrics"] = out

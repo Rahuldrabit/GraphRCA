@@ -102,6 +102,64 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+# Anomaly targets that are inherently decisive -- a connection refused, a log
+# ERROR line, a request timeout, or an unhealthy pod is real evidence
+# regardless of how many times it occurred. These count toward
+# anomaly_detected at any relevance.
+_DECISIVE_ANOMALY_TARGETS = {"CONNECTION_REFUSED", "LOG_ERROR", "TIMEOUT", "POD_UNHEALTHY"}
+
+# Magnitude-based targets (HIGH_CPU/HIGH_MEM/HIGH_LATENCY/HTTP_ERROR) are
+# comparisons against peers or against count caps, and ordinary architecture
+# clears a low bar on nearly every run (a datastore is always "bigger" than
+# an app pod; a gateway always logs more spans). For DETECTION specifically
+# -- "is anything actually wrong" -- these must clear a real severity floor,
+# not just the generous, recall-oriented threshold that feeds localization's
+# candidate list. Checked against a real stored noop (no-fault) session
+# (all_tasks_08-15.../12-detection-noop_detection_hotel_reservation-1): this
+# floor alone is NOT sufficient -- container cold-start memory/CPU ramps
+# (near-zero at boot climbing to steady state) produce z-scores in the
+# hundreds to thousands on the temporal channel, saturating relevance at
+# 1.0 for perfectly healthy pods. See _MAGNITUDE_CONCENTRATION_CEILING
+# below, which is what actually distinguishes that case: 12 of ~19 services
+# (63%) were flagged simultaneously in that session, characteristic of a
+# cluster-wide startup transient, not a localized fault.
+_DETECTION_RELEVANCE_FLOOR = _env_float("GRAPHRCA_DETECTION_RELEVANCE_FLOOR", 0.3)
+
+# If magnitude-based signals (post-floor) are flagged on more than this
+# fraction of distinct services observed, treat it as simultaneous/systemic
+# noise (cluster warm-up, shared post-fault residue) rather than a
+# localized fault, and don't let magnitude alone drive anomaly_detected.
+# Decisive targets (_DECISIVE_ANOMALY_TARGETS) are exempt from this check --
+# a real widespread outage genuinely logging errors everywhere should still
+# detect as True.
+_MAGNITUDE_CONCENTRATION_CEILING = _env_float("GRAPHRCA_MAGNITUDE_CONCENTRATION_CEILING", 0.3)
+
+# Saturation points for the log-scaled count channels (see _rel_log). Set
+# generously above what a genuinely severe, isolated fault produces, so
+# ordinary counts still spread out across the [0,1] range instead of
+# clustering near 1.0.
+_HTTP_ERROR_SATURATE = _env_float("GRAPHRCA_HTTP_ERROR_SATURATE", 100.0)
+_LOG_ERROR_SATURATE = _env_float("GRAPHRCA_LOG_ERROR_SATURATE", 100.0)
+_TIMEOUT_SATURATE = _env_float("GRAPHRCA_TIMEOUT_SATURATE", 50.0)
+_CONN_REFUSED_SATURATE = _env_float("GRAPHRCA_CONN_REFUSED_SATURATE", 50.0)
+_POD_UNHEALTHY_SATURATE = _env_float("GRAPHRCA_POD_UNHEALTHY_SATURATE", 10.0)
+
+# Restart count alone (independent of current status/readiness) only counts
+# as pod-unhealthy evidence above this floor -- see the restart-count
+# staleness note in parse_kubectl. Kind's default crash-loop backoff caps
+# around 5 minutes between restarts, so a still-actively-crashing pod
+# reaches high counts quickly within one task's observation window; a
+# recovered pod's count just sits wherever the LAST fault left it.
+_RESTART_ACTIVE_CRASHLOOP_FLOOR = _env_int("GRAPHRCA_RESTART_ACTIVE_FLOOR", 8)
+
+
 class ObserverAgent:
     """
     Non-LLM rule engine.
@@ -149,6 +207,29 @@ class ObserverAgent:
         """Map a signal count to a [0,1] salience for ScratchPad metadata."""
         try:
             return round(min(1.0, float(count) / float(cap)), 3) if cap > 0 else 1.0
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _rel_log(count: float, saturate: float) -> float:
+        """Log-scaled count relevance -- doesn't saturate every real signal to 1.0.
+
+        `_rel`'s linear `count/cap` was the ScratchPad-relevance saturation
+        this project has been chasing: verified against the live DB, it
+        pinned 72% of `emits` rows and 86% of `calls` rows at exactly 1.0,
+        so a token-bounded view's "top facts" tier was a 3+-way tie broken
+        by arbitrary SQL row order, not by which service was actually worse.
+        Already fixed this way for the metric channels
+        (_flag_metric_cross_sectional/temporal_outliers); this brings the
+        remaining count-based channels (log errors, timeouts, connection
+        failures, unhealthy pods) onto the same scale, using log1p so
+        count=0 still maps to 0 and small counts aren't crushed toward 0
+        the way a log10 of a small integer would be.
+        """
+        try:
+            count = max(0.0, float(count))
+            saturate = max(1.0, float(saturate))
+            return round(min(1.0, math.log1p(count) / math.log1p(saturate)), 3)
         except Exception:
             return 1.0
 
@@ -245,7 +326,7 @@ class ObserverAgent:
             triplets.append({
                 "source": svc, "relationship": "emits", "target": "HTTP_ERROR",
                 "citation_quote": f"trace error_spans={n}",
-                "relevance": self._rel(n),
+                "relevance": self._rel_log(n, _HTTP_ERROR_SATURATE),
             })
 
         # Emit high-latency blocks (services well above the median duration).
@@ -306,9 +387,11 @@ class ObserverAgent:
                 continue
 
             bad = False
+            currently_unhealthy = False
             reasons = []
             if status and status not in _HEALTHY_POD_STATUS:
                 bad = True
+                currently_unhealthy = True
                 reasons.append(f"status={status}")
             # 0/N ready containers
             if "/" in ready:
@@ -316,12 +399,28 @@ class ObserverAgent:
                     up, tot = ready.split("/")
                     if int(up) == 0 and int(tot) > 0:
                         bad = True
+                        currently_unhealthy = True
                         reasons.append(f"ready={ready}")
                 except Exception:
                     pass
+            # Restart count alone is a LIFETIME counter -- on the shared kind
+            # cluster this benchmark harness reuses across sequential tasks,
+            # a pod that crashed under an EARLIER task's injected fault still
+            # carries that count into later tasks even after it's fully
+            # recovered (Running, N/N Ready). Verified against a real noop
+            # (no-fault) session: geo/profile/rate all showed restarts=3-4
+            # with no status/ready problem, which alone made
+            # anomaly_detected=True on a task where nothing was wrong. Only
+            # trust restarts alone once they're high enough to suggest an
+            # ACTIVE crash loop rather than old history (a pod that
+            # genuinely can't stay up still shows a bad status/ready most of
+            # the time anyway, so this only changes the borderline case).
             try:
-                if int(restarts) >= 3:
+                r = int(restarts)
+                if r >= _RESTART_ACTIVE_CRASHLOOP_FLOOR:
                     bad = True
+                    reasons.append(f"restarts={restarts}")
+                elif r >= 3 and currently_unhealthy:
                     reasons.append(f"restarts={restarts}")
             except Exception:
                 pass
@@ -336,7 +435,7 @@ class ObserverAgent:
             triplets.append({
                 "source": svc, "relationship": "emits", "target": target,
                 "citation_quote": "kubectl pods " + ", ".join(sorted(set(entry["reasons"]))),
-                "relevance": self._rel(entry["n"], cap=4),
+                "relevance": self._rel_log(entry["n"], _POD_UNHEALTHY_SATURATE),
             })
         return triplets
 
@@ -501,7 +600,14 @@ class ObserverAgent:
                     f"metric {metric_name} current={c_mean:.3f} baseline={b_mean:.3f} "
                     f"(z={z:.1f}, own-history)"
                 ),
-                "relevance": round(min(1.0, abs(z) / saturate), 3),
+                # Log-scaled, not linear -- real "own-history" z-scores routinely
+                # land in the hundreds to thousands (a container's memory/CPU
+                # climbing from near-zero at cold-start to steady-state looks
+                # identical in magnitude to a genuine fault by this metric),
+                # so a linear z/saturate pinned nearly everything above the
+                # z_thresh=3 floor to relevance=1.0 -- defeating the very
+                # discrimination this docstring says saturate exists for.
+                "relevance": round(min(1.0, math.log1p(abs(z)) / math.log1p(max(saturate, 1.0))), 3),
             })
         return triplets
 
@@ -695,13 +801,13 @@ class ObserverAgent:
             triplets.append({
                 "source": svc, "relationship": "emits", "target": "LOG_ERROR",
                 "citation_quote": f"logs error_lines={n}",
-                "relevance": self._rel(n, cap=10),
+                "relevance": self._rel_log(n, _LOG_ERROR_SATURATE),
             })
         for svc, n in timeout_counts.items():
             triplets.append({
                 "source": svc, "relationship": "blocks", "target": "TIMEOUT",
                 "citation_quote": f"logs timeout_lines={n}",
-                "relevance": self._rel(n, cap=6),
+                "relevance": self._rel_log(n, _TIMEOUT_SATURATE),
             })
         # Connection failures: a definitive root-cause signal (the service is
         # unreachable). One such triplet should outweigh downstream metric
@@ -710,7 +816,7 @@ class ObserverAgent:
             triplets.append({
                 "source": svc, "relationship": "emits", "target": "CONNECTION_REFUSED",
                 "citation_quote": f"logs connection_refused_lines={n}",
-                "relevance": self._rel(n, cap=10),
+                "relevance": self._rel_log(n, _CONN_REFUSED_SATURATE),
             })
         return triplets
 
@@ -746,12 +852,52 @@ class ObserverAgent:
                 triplets.extend(got)
                 breakdown[label] = len(got)
 
-        # Anomaly = any non-calls, non-token signal (errors/latency/bad pods/log errs).
-        anomaly = any(
-            (t.get("relationship") in ("emits", "blocks"))
-            and not _is_token(t.get("source", ""))
-            for t in triplets
-        )
+        # Anomaly = any non-calls, non-token signal that is either inherently
+        # decisive (an error/timeout/connection-refused/unhealthy pod, which
+        # is real evidence at any count) or a magnitude-based signal
+        # (HIGH_CPU/HIGH_MEM/HIGH_LATENCY/HTTP_ERROR) severe enough to clear
+        # _DETECTION_RELEVANCE_FLOOR, not merely present. The old rule used
+        # `any(emits/blocks triplet exists)`, which the loose,
+        # recall-oriented localization candidate threshold satisfies on
+        # almost every real deployment regardless of fault -- some service
+        # is always >2x another's mean in a heterogeneous system. That made
+        # anomaly_detected structurally unable to answer "No": measured
+        # 79/79 runs True, 27/27 detection submissions "Yes", including the
+        # one noop (no-fault) task in that sample. This does not change
+        # localization's candidate generation at all -- only this binary
+        # detection decision.
+        def _is_anomaly_shaped(t: Dict[str, Any]) -> bool:
+            return t.get("relationship") in ("emits", "blocks") and not _is_token(t.get("source", ""))
+
+        def _clears_floor(t: Dict[str, Any]) -> bool:
+            try:
+                return float(t.get("relevance", 0.0)) >= _DETECTION_RELEVANCE_FLOOR
+            except (TypeError, ValueError):
+                return False
+
+        decisive = [t for t in triplets if _is_anomaly_shaped(t) and t.get("target") in _DECISIVE_ANOMALY_TARGETS]
+        magnitude = [t for t in triplets if _is_anomaly_shaped(t) and t.get("target") not in _DECISIVE_ANOMALY_TARGETS]
+        magnitude_over_floor = [t for t in magnitude if _clears_floor(t)]
+
+        # Concentration check for the magnitude channel only (decisive
+        # targets bypass this -- see the constant's docstring). Denominator
+        # is every distinct service that emitted ANY anomaly-shaped
+        # triplet, not the whole cluster, so a small deployment isn't
+        # unfairly penalized for having few services to spread signal
+        # across.
+        all_flagged_svcs = {t["source"] for t in triplets if _is_anomaly_shaped(t)}
+        magnitude_svcs = {t["source"] for t in magnitude_over_floor}
+        concentration = (len(magnitude_svcs) / len(all_flagged_svcs)) if all_flagged_svcs else 0.0
+        magnitude_is_systemic_noise = concentration > _MAGNITUDE_CONCENTRATION_CEILING
+
+        anomaly = bool(decisive) or (bool(magnitude_over_floor) and not magnitude_is_systemic_noise)
+        if magnitude_over_floor and magnitude_is_systemic_noise and not decisive:
+            logger.info(
+                f"[Observer] magnitude anomalies on {len(magnitude_svcs)}/{len(all_flagged_svcs)} "
+                f"services ({concentration:.0%}) exceed the systemic-noise ceiling "
+                f"({_MAGNITUDE_CONCENTRATION_CEILING:.0%}) -- treating as cluster-wide "
+                "noise, not a localized fault, for the detection decision"
+            )
 
         # Always record the task marker for context (not an anomaly signal).
         triplets.append({

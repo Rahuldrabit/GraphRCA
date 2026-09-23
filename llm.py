@@ -33,10 +33,20 @@ _total_completion_tokens: int = 0
 
 
 def set_llm_log_dir(output_dir: str):
-    """Set the directory for LLM justification logs. Called by run_pipeline."""
+    """Set the directory for LLM justification logs. Called by run_pipeline.
+
+    Also stamped into an env var, not just the module global: this repo is
+    importable under two names (`llm` and `GraphRCA_agent.llm`, because
+    `GraphRCA_agent` is a self-symlink to `.`), so a caller that imports
+    one name never sees a global set on the other -- every swarm node call
+    was silently falling back to the relative GraphRCA/logs/ path instead
+    of the per-task output dir. An env var is process-wide, immune to which
+    module identity did the writing.
+    """
     global _llm_log_path
     os.makedirs(output_dir, exist_ok=True)
     _llm_log_path = os.path.join(output_dir, "llm_justification.jsonl")
+    os.environ["GRAPHRCA_LLM_LOG_PATH"] = _llm_log_path
     logger.info(f"LLM justification log: {_llm_log_path}")
 
 
@@ -116,8 +126,10 @@ def _log_llm_call(caller: str, model: str, prompt: str, system_prompt: str,
     except Exception:
         pass
 
-    # Write to pipeline output dir if configured
-    log_path = _llm_log_path
+    # Write to pipeline output dir if configured. Check the env var first
+    # (set by set_llm_log_dir on ANY module identity, see its docstring)
+    # before this identity's own possibly-unset module global.
+    log_path = os.environ.get("GRAPHRCA_LLM_LOG_PATH") or _llm_log_path
     if log_path is None:
         # Fallback to GraphRCA/logs/
         os.makedirs("GraphRCA/logs", exist_ok=True)
