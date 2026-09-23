@@ -32,49 +32,11 @@ trace_ingest → graph_builder → detection → memory_search
 
 ---
 
-### Graph-State Orchestrated (GSO) Multi-Agent Architecture
+### ScratchPad 4-Agent Swarm (New)
 
-The pipeline has been upgraded into a **Graph-State Orchestrated (GSO)** 4-agent swarm architecture backed by the [ScratchPad](../ScratchPad/) Universal GraphRAG Middleware, optimized for Small Language Models ($\le$20B params) and zero conversational history overhead.
+The pipeline has been redesigned into a **4-agent swarm** architecture backed by the [ScratchPad](../ScratchPad/) middleware, optimized for Small Language Models (≤20B params) and zero conversational history overhead.
 
-#### 1. System Paradigm & Core Innovations
-
-Standard agent frameworks fail on resource-constrained, local SLMs because appending raw telemetry dumps (Jaeger traces, Prometheus metrics, Kubernetes container logs) directly to an agent's prompt history causes exponential context window growth. This leads to attention degradation ("Lost in the Middle"), high VRAM usage, out-of-memory crashes, and hallucinated tool parameters.
-
-The GSO architecture replaces conversational message passing with a **Deterministic Cognitive Proxy**.
-
-```
-[ AIOpsLab Infrastructure / Telemetry ]
-                 │
-                 ▼ (Raw Telemetry Streams / Multi-hop Traces)
-┌────────────────────────────────────────────────────────┐
-│             SCRATHPAD MIDDLEWARE GATEWAY               │
-│                                                        │
-│  • Token Knapsack Optimization (<500 Token Views)      │
-│  • Fuzzy Entity Canonicalization (RapidFuzz)           │
-│  • Exact-Substring Citation Verification Gate          │
-│  • Louvain Background Community Sweeper (L1 -> L2)     │
-│  • SQLite WAL Concurrent Persistence                   │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼ (Bounded Markdown Summaries)
-┌────────────────────────────────────────────────────────┐
-│              LANGGRAPH CONTROL STATE MACHINE           │
-│                                                        │
-│  [Observer] ──> [Topological Math] ──> [RCA Analyst]   │
-│   (Non-LLM)     (NetworkX PageRank)     (Local SLM)    │
-│                         │                    │         │
-│                         ▼                    ▼         │
-│               [Guardrail Actuator] ──> [AIOpsLab ACI]  │
-└────────────────────────────────────────────────────────┘
-```
-
-**Core Innovations:**
-1. **Decoupled State Control:** The LangGraph state machine carries only lightweight metadata pointers (`session_id`, `suspect_nodes`, `confirmed_rca`, `status`). It contains zero raw text history.
-2. **Tool Interceptor Gate:** Tools interacting with the AIOpsLab Agent-Cloud Interface (ACI) do not return raw stdout/JSON to the agent context. Raw execution outputs are intercepted, piped to `ScratchPad`, parsed into structural triplets, and indexed. The tool returns only a token-bounded ($\le$500 tokens) Markdown graph summary back to the model.
-3. **Dual-Memory Topology:** System memory is partitioned into Shared System Memory (storing global, citation-verified topology and facts) and Private Agent Workspaces (trapping unverified agent drafts and intermediate tool attempts).
-4. **Algorithmic Offloading:** Graph-topological calculations (multi-hop path traversal and root-cause localization) are executed deterministically on CPU via `NetworkX`, bypassing the LLM entirely for graph math.
-
-#### 2. Swarm Topology
+#### Architecture Diagram
 
 ```mermaid
 graph TD
@@ -83,7 +45,7 @@ graph TD
     INIT -->|"invoke swarm graph"| G["LangGraph StateGraph"]
     
     subgraph "4-Agent Swarm Pipeline"
-        G --> OBS["1. Observer Agent<br/>(Non-LLM Rule Engine + RapidFuzz)"]
+        G --> OBS["1. Observer Agent<br/>(Non-LLM Rule Engine)"]
         
         OBS -->|"get_traces()"| A
         OBS -->|"get_logs()"| A  
@@ -114,52 +76,47 @@ graph TD
     end
 ```
 
-| Agent Node | Engine Type | Memory Access | Role & Operational Mechanism |
-| --- | --- | --- | --- |
-| **1. Telemetry Observer** | Non-LLM Rule Parser | Write $\rightarrow$ Shared | Ingests alert triggers (Prometheus metrics, 5xx rates, traces, logs, kubectl). Applies RapidFuzz entity canonicalization, converts telemetry into $L_1$ structural triplets (`[service] -EMITS-> [MetricSpike]`), and writes directly to Shared Memory. |
-| **2. Topological Diagnoser** | Python / `NetworkX` | Read $\rightarrow$ Shared | **Zero-token node.** Pulls active SQLite edges, constructs a directed graph, reverses dependency call edges (`CALLS`), and calculates Personalized PageRank (PPR). Writes the top 3 candidate node IDs into state. |
-| **3. RCA Analyst** | Local SLM ($\le$20B) | Read $\rightarrow$ Shared View<br>Write $\rightarrow$ Private | Reads the bounded $\le$500-token Markdown neighborhood view. Issues diagnostic commands via Tool Interceptor. Promotes hypotheses to Shared Memory after exact-substring citation verification. |
-| **4. Guardrail Actuator** | Local SLM + Rule Engine | Read $\rightarrow$ Shared | Reads verified root cause from Shared Memory. Validates proposed mitigation commands against deterministic regex safety rules (blocking destructive commands). Executes approved recovery commands via AIOpsLab ACI. |
+#### Data Flow Diagram (Per Task Execution)
 
-#### 3. Tool Interceptor Gate Architecture
+```mermaid
+sequenceDiagram
+    participant O as AIOpsLab Orchestrator
+    participant A as agent_aiopslab.py
+    participant OBS as Observer (Non-LLM)
+    participant SP as ScratchPad SQLite
+    participant TOPO as Diagnoser (NetworkX)
+    participant RCA as RCA Analyst (SLM)
+    participant ACT as Actuator (SLM+Rules)
 
+    O->>A: problem_desc + instructions + APIs
+    A->>SP: init_session(problem_id, goal)
+    A->>OBS: invoke observer_node(state)
+    
+    OBS->>O: get_traces("namespace", 5)
+    O-->>OBS: CSV/DataFrame traces
+    OBS->>SP: commit L1 triplets (calls, emits, connects_to)
+    
+    OBS->>O: exec_shell("kubectl get pods")
+    O-->>OBS: pod status text
+    OBS->>SP: commit L1 triplets (emits CrashLoopBackOff)
+    
+    Note over OBS,SP: All raw text → ScratchPad<br/>Only ≤500 token view exits
+    
+    SP->>TOPO: read active edges
+    TOPO->>TOPO: build DiGraph, reverse calls, compute PPR
+    TOPO-->>A: suspect_nodes = ["payment-db", "cart-svc", "auth"]
+    
+    SP->>RCA: compile_bounded_markdown_view(max_tokens=500)
+    RCA->>RCA: llm_reason(suspects + markdown_context)
+    RCA->>SP: commit_verified_hypothesis(citation_quote match)
+    
+    RCA-->>ACT: confirmed_root_cause
+    ACT->>ACT: safety regex check
+    ACT->>O: exec_shell("kubectl rollout restart deployment/geo")
+    O-->>ACT: stdout result
+    
+    ACT->>O: submit("Yes") / submit(["geo"]) / submit({...}) / submit()
 ```
-[Agent Issues Tool Call] ──► [Executes AIOpsLab ACI API]
-                                         │
-                                         ▼ (Raw Output / Traces / CSVs)
-                            [Scratchpad Interceptor Gate]
-                                         │
-                                         ├─► 1. RapidFuzz Entity Canonicalization
-                                         ├─► 2. L1 Triplet Extraction & Ingestion
-                                         ├─► 3. Exact-Substring Citation Indexing
-                                         └─► 4. SQLite WAL Database Persistence
-                                         │
-                                         ▼
-                            [Token Knapsack Context Builder]
-                                         │
-                                         ▼
-                            [Returns Bounded <500 Token Markdown Summary] ──► [Agent Prompt]
-```
-
-#### 4. End-to-End Operational Lifecycle
-
-1. **Phase 1: Session Init:** Session initialized in `ScratchPad` SQLite (`session_id = incident_{problem_id}`).
-2. **Phase 2: Ingestion & Canonicalization:** **Telemetry Observer** converts raw telemetry to $L_1$ triplets using `RapidFuzz` canonicalization.
-3. **Phase 3: Topological Localization:** **Topological Diagnoser** reverses call edges and executes NetworkX Personalized PageRank to isolate top 3 suspects with zero LLM tokens.
-4. **Phase 4: Deep Analysis & Grounded Citation:** **RCA Analyst** reads bounded $\le$500 token view, formulates hypothesis, and verifies verbatim `citation_quote` in `ScratchPad`.
-5. **Phase 5: Guardrail Execution:** **Guardrail Actuator** evaluates commands against regex firewall (`rm -rf`, `delete ns`) and dispatches recovery action to AIOpsLab.
-6. **Phase 6: Asynchronous Sweeping & Benchmarking:** Louvain sweeper (`sweeper.py`) compresses dense error clusters into macro $L_2$ summary nodes, while `run_all_tasks.py` records TTD, TTL, TTA, TTM, and token usage into unified batch reports.
-
-#### 5. Methodological Evolution (GraphRCA vs. GSO)
-
-| Architectural Metric | Traditional Linear Multi-Agent / Previous GraphRCA | Proposed Graph-State Orchestration (GSO) |
-| --- | --- | --- |
-| **Memory Mechanics** | Conversational chat history appended sequentially across agent hops. | Centralized, stateful property graph in SQLite (`ScratchPad`). |
-| **Token Consumption Curve** | Exponential growth per turn; prone to context exhaustion and OOM. | **Bounded & Flat** ($\le$500 tokens per turn regardless of log volume). |
-| **Multi-Hop Localization** | Probabilistic guesswork by LLM reading long prose logs. | **Deterministic Math:** NetworkX Personalized PageRank on CPU. |
-| **Tool Execution Output** | Raw logs (5,000+ lines) dumped directly into agent prompt window. | Intercepted, parsed into $L_1$/$L_2$ triplets, canonicalized, and summarized. |
-| **Hallucination Control** | Soft prompt instructions ("Be concise", "Do not invent facts"). | **Hard Architectural Gate:** Exact-substring verification (`citation_quote`). |
-| **Local Hardware Viability** | Fails on local models ($\le$20B) due to context starvation. | **Optimized for Local SLMs** (Gemma-2-9B, Qwen-2.5-14B, Llama-3.1-8B). |
 
 ---
 

@@ -33,6 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV="$SCRIPT_DIR/venv"
 AIOPSLAB_ROOT="${AIOPSLAB_ROOT:-$REPO_ROOT/AIOpsLab}"
+export PATH="$HOME/.local/bin:$PATH"
 
 # Prefer an explicit Python interpreter (venv-first) so we don't depend on the
 # presence of a system-wide `python` shim.

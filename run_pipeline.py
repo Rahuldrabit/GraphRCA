@@ -24,10 +24,17 @@ import sys
 import time
 from datetime import datetime
 
-# Inject ScrathPad into sys.path
-scratchpad_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "ScrathPad"))
-if scratchpad_path not in sys.path:
-    sys.path.insert(0, scratchpad_path)
+# Inject ScratchPad src into sys.path (engine.py + siblings live in <root>/ScratchPad/src)
+_repo_root = os.path.dirname(os.path.abspath(__file__))
+for _sp_src in (
+    os.path.join(_repo_root, "ScratchPad", "src"),
+    os.path.join(_repo_root, "ScrathPad", "src"),                 # legacy typo
+    os.path.join(_repo_root, "..", "ScratchPad", "src"),          # sibling repo (README layout)
+):
+    if os.path.isfile(os.path.join(_sp_src, "engine.py")):
+        if _sp_src not in sys.path:
+            sys.path.insert(0, _sp_src)
+        break
 
 from dotenv import load_dotenv
 
@@ -455,17 +462,36 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
     logger.info(f"[AIOpsLab] Instructions:\n{str(instructions)[:300]}")
 
     # Create threaded agent (mirrors StratusAgent_AIOpsLab)
+    # Agent selection order:
+    #   1. GRAPHRCA_AGENT_MODE=scratchpad_swarm → 4-agent ScratchPad swarm
+    #   2. else GRAPHRCA_V5_ENABLED=True (default) → v5 variable-router agent
+    #   3. else → legacy LangGraph pipeline agent
+    agent_mode = os.getenv("GRAPHRCA_AGENT_MODE", "pipeline").lower().strip()
     use_v5 = os.getenv("GRAPHRCA_V5_ENABLED", "True").lower() == "true"
-    
-    if use_v5:
+    use_neo4j_flag = os.getenv("NEO4J_ENABLED", "False").lower() == "true"
+
+    if agent_mode == "scratchpad_swarm":
+        from GraphRCA_agent.swarm_agent_aiopslab import SwarmGraphRCAAgent
+        agent = SwarmGraphRCAAgent(
+            problem_desc=problem_desc,
+            task_type=task_type,
+            output_dir=output_dir,
+            verbose=verbose,
+            use_neo4j=use_neo4j_flag,
+        )
+        # Swarm rides the legacy threaded communicator model.
+        orchestrator.register_agent(agent, name=orchestrator.agent_name)
+        agent.run()
+    elif use_v5:
         from GraphRCA_agent.agent_aiopslab import GraphRCAAgentV5
         agent = GraphRCAAgentV5(
             problem_desc=problem_desc,
             task_type=task_type,
             output_dir=output_dir,
             verbose=verbose,
-            use_neo4j=os.getenv("NEO4J_ENABLED", "False").lower() == "true",
+            use_neo4j=use_neo4j_flag,
         )
+        orchestrator.register_agent(agent, name=orchestrator.agent_name)
     else:
         from GraphRCA_agent.agent_aiopslab import GraphRCAAgent
         agent = GraphRCAAgent(
@@ -473,12 +499,9 @@ def run_aiopslab(problem_id: str = None, output_dir: str = None, verbose: bool =
             task_type=task_type,
             output_dir=output_dir,
             verbose=verbose,
-            use_neo4j=os.getenv("NEO4J_ENABLED", "False").lower() == "true",
+            use_neo4j=use_neo4j_flag,
         )
-
-    # Register and start (same pattern as Stratus)
-    orchestrator.register_agent(agent, name=orchestrator.agent_name)
-    if not use_v5:
+        orchestrator.register_agent(agent, name=orchestrator.agent_name)
         agent.run()
 
     benchmark_start = time.time()

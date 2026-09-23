@@ -156,6 +156,32 @@ def get_temperature() -> float:
     return float(os.getenv("TEMPERATURE_AGENTS", "0.0"))
 
 
+def get_top_p():
+    """Get top_p from environment, or None to use the server default."""
+    raw = os.getenv("TOP_P_AGENTS", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def get_top_k():
+    """Get top_k from environment, or None to leave unset.
+
+    The OpenAI API has no top_k, but ollama and other local servers accept it;
+    callers pass it via the request's passthrough (extra_body).
+    """
+    raw = os.getenv("TOP_K_AGENTS", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
 def get_openai_client() -> OpenAI:
     """Return a shared raw OpenAI client (lazy init)."""
     global _openai_client
@@ -219,12 +245,21 @@ def llm_reason(prompt: str, system_prompt: str = "", max_tokens: int = 2000,
 
     t0 = time.time()
     try:
-        response = client.chat.completions.create(
+        kwargs = dict(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=get_temperature(),
         )
+        top_p = get_top_p()
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        top_k = get_top_k()
+        if top_k is not None:
+            # The OpenAI API has no top_k; ollama/local servers accept it via the
+            # passthrough body. Required for gemma4's recommended sampling (top_k=64).
+            kwargs["extra_body"] = {"top_k": top_k}
+        response = client.chat.completions.create(**kwargs)
         elapsed = time.time() - t0
         content = response.choices[0].message.content or ""
 

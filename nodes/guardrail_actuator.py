@@ -34,7 +34,15 @@ class GuardrailActuator:
     def __call__(self, state: AIOpsIncidentState) -> AIOpsIncidentState:
         task_type = state["task_type"]
         root_cause = state.get("verified_root_cause")
-        
+
+        # Detection is a binary decision driven by the observer's anomaly flag —
+        # no LLM needed, and it correctly answers "No" for noop (no-fault) tasks.
+        if task_type == "detection":
+            detected = bool(state.get("anomaly_detected", False))
+            state["final_submission"] = {"action": "submit", "value": "Yes" if detected else "No"}
+            logger.info(f"[Guardrail] detection submission: {'Yes' if detected else 'No'}")
+            return state
+
         if not root_cause:
             logger.warning("No root cause verified. Sending default submission.")
             self._set_default_submission(state)
